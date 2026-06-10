@@ -1,0 +1,224 @@
+================================================================================
+VEXA  +  GOOGLE MEET TRANSCRIPTION  ->  CLOUDFLARE D1
+Implementation Plan
+================================================================================
+
+GOAL
+--------------------------------------------------------------------------------
+A bot that joins a Google Meet, transcribes everything spoken (speech-to-text),
+and stores the transcripts in a Cloudflare D1 database.
+
+This repo (Vexa) already does ~90% of this out of the box:
+  - Joins Google Meet via a headless-Chromium bot (Playwright + stealth).
+  - Captures PER-SPEAKER audio and runs it through Whisper STT.
+  - Persists deduplicated, speaker-attributed transcript segments to PostgreSQL
+    and exposes them over a REST API.
+
+So this is NOT "build from scratch". It is two things:
+  1. Stand up Vexa locally and get a bot transcribing a real Google Meet.
+  2. Add a small forwarding hook that mirrors each finalized transcript segment
+     into Cloudflare D1, in ADDITION to Vexa's own Postgres.
+
+The mirror hooks into the single point where Vexa writes FINALIZED segments to
+Postgres, so it inherits Vexa's immutability window, speaker mapping, and
+segment_id deduplication for free. It is best-effort: a D1 outage never blocks
+or disrupts the meeting; Postgres stays authoritative.
+
+DEFAULTS CHOSEN (easy to revisit)
+  - Timing:    forward each finalized segment as it is committed (~30-40s after
+               spoken). This also yields the full transcript by meeting end, so
+               it covers the "batch after meeting" case too.
+  - STT engine: start with Vexa's HOSTED transcription endpoint (no GPU needed).
+               Switching to self-hosted Whisper later is an env-var change only.
+
+
+================================================================================
+PART 1 - STAND UP VEXA AND TRANSCRIBE A GOOGLE MEET  (no code changes)
+================================================================================
+
+1. Create the repo-root .env:
+     cp deploy/env-example .env
+   Set the required fields:
+     TRANSCRIPTION_SERVICE_URL=https://transcription.vexa.ai/v1/audio/transcriptions
+     TRANSCRIPTION_SERVICE_TOKEN=<your-vexa-token>   # get a key at vexa.ai
+   (Leave LOCAL_TRANSCRIPTION commented out for now.)
+
+2. Launch the full stack (recommended over `make lite`, because the Cloudflare
+   hook lives in the meeting-api service and the multi-container layout makes it
+   easy to rebuild just that one image):
+     cd deploy/compose && make all
+   Dashboard: http://localhost:3001    API: http://localhost:8056
+
+3. Create an API key:
+     cd deploy/compose && make setup-api-key      # prints VEXA_API_KEY
+
+4. Start a bot in your meeting (native_meeting_id is the abc-defg-hij part of
+   the meet.google.com URL):
+     curl -X POST "http://localhost:8056/bots" \
+       -H "X-API-Key: $VEXA_API_KEY" -H "Content-Type: application/json" \
+       -d '{"platform":"google_meet","native_meeting_id":"abc-defg-hij"}'
+
+5. Admit the bot in the Meet, talk, then read the transcript back:
+     curl -H "X-API-Key: $VEXA_API_KEY" \
+       "http://localhost:8056/transcripts/google_meet/abc-defg-hij"
+
+   Once segments appear here, Vexa is fully working; only the D1 mirror remains.
+
+
+================================================================================
+PART 2 - MIRROR FINALIZED SEGMENTS INTO CLOUDFLARE D1
+================================================================================
+
+WHERE IT HOOKS IN
+  services/meeting-api/meeting_api/collector/db_writer.py
+    -> process_redis_to_postgres(), the `if batch_to_store:` block.
+  At that point Vexa has a list of Transcription ORM objects that are FINALIZED
+  (past the 30s immutability threshold), SPEAKER-MAPPED, and DEDUPLICATED by
+  segment_id. Right after the successful `await db.commit()`, we forward the
+  same batch to D1. Forwarding AFTER the local commit keeps Postgres
+  authoritative and means a D1 outage can never block local persistence.
+
+WHY THIS APPROACH (vs. alternatives)
+  - vs. a standalone Redis-stream sidecar: the raw `transcription_segments`
+    stream carries UNMAPPED speakers and pre-finalization drafts; the db_writer
+    hook gets the same clean, mapped, deduped data Vexa stores itself, with zero
+    re-implementation.
+  - vs. POST_MEETING_HOOKS / webhooks (batch-only at meeting end): viable and
+    even less invasive, but gives nothing until the meeting completes and bundles
+    the whole transcript in one payload. The db_writer hook gives near-real-time
+    rows AND the full transcript by the end. If you only ever want the
+    end-of-meeting batch, we can instead point POST_MEETING_HOOKS at a tiny
+    forwarder and skip the db_writer edit entirely.
+
+
+FILES CHANGED / ADDED
+--------------------------------------------------------------------------------
+
+[NEW] services/meeting-api/meeting_api/collector/d1_forwarder.py
+  Exposes async forward_segments_to_d1(segments: list[Transcription]).
+  - No-op unless CLOUDFLARE_D1_ENABLED and CF_* credentials are set.
+  - Builds a chunked (50 rows/chunk, under SQLite's 999-variable cap) multi-row
+    INSERT ... ON CONFLICT (meeting_id, segment_id) DO UPDATE, the documented D1
+    single-query format: POST to
+      https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_D1_DATABASE_ID}/query
+    with header  Authorization: Bearer {CF_API_TOKEN}
+    and body     {"sql": "...", "params": [...]}
+  - Uses httpx (already a meeting-api dependency).
+  - params are sent as strings (D1's documented type); SQLite column affinity
+    coerces numeric strings back to INTEGER/REAL on insert. NULLs stay JSON null.
+  - Segments without a segment_id are skipped (rare legacy rows; Postgres keeps
+    them regardless).
+  - Catches ALL network/JSON errors and logs them only -> NEVER raises.
+
+[EDIT] services/meeting-api/meeting_api/collector/db_writer.py
+  After the successful commit + Redis cleanup:
+      try:
+          await forward_segments_to_d1(batch_to_store)
+      except Exception as e:
+          logger.error(f"D1 forward failed (non-fatal): {e}", exc_info=True)
+  Plus the import at top of file.
+
+[EDIT] services/meeting-api/meeting_api/collector/config.py
+  New env-driven settings:
+      CLOUDFLARE_D1_ENABLED   (default "false")
+      CF_ACCOUNT_ID, CF_D1_DATABASE_ID, CF_API_TOKEN
+      CF_D1_TABLE             (default "transcriptions")
+      CF_D1_TIMEOUT_SECONDS   (default 10)
+
+[EDIT] deploy/compose/docker-compose.yml
+  Passes CLOUDFLARE_D1_ENABLED / CF_ACCOUNT_ID / CF_D1_DATABASE_ID / CF_API_TOKEN
+  / CF_D1_TABLE into the meeting-api service environment.
+
+[EDIT] deploy/env-example
+  Documents the new vars (the compose Makefile auto-patches these into .env).
+
+[NEW] deploy/cloudflare-d1/schema.sql
+  Ready-to-apply D1 schema mirroring the Transcription model. Composite
+  PRIMARY KEY (meeting_id, segment_id) makes the upsert idempotent (matches the
+  Postgres unique index), so re-sent segments overwrite instead of duplicating.
+
+[NEW] deploy/cloudflare-d1/README.md
+  Full setup + verify + disable guide.
+
+
+D1 SCHEMA (run once)
+--------------------------------------------------------------------------------
+  wrangler d1 execute <DB_NAME> --remote --file deploy/cloudflare-d1/schema.sql
+
+  CREATE TABLE IF NOT EXISTS transcriptions (
+    meeting_id   INTEGER NOT NULL,
+    segment_id   TEXT    NOT NULL,
+    start_time   REAL    NOT NULL,
+    end_time     REAL    NOT NULL,
+    text         TEXT    NOT NULL,
+    speaker      TEXT,
+    language     TEXT,
+    session_uid  TEXT,
+    created_at   TEXT,
+    PRIMARY KEY (meeting_id, segment_id)
+  );
+
+
+CONFIGURE (.env at repo root)
+--------------------------------------------------------------------------------
+  CLOUDFLARE_D1_ENABLED=true
+  CF_ACCOUNT_ID=<your-cloudflare-account-id>
+  CF_D1_DATABASE_ID=<your-d1-database-id>
+  CF_API_TOKEN=<api-token-with-D1-Edit-permission>
+  CF_D1_TABLE=transcriptions        # optional, default
+
+
+REBUILD
+--------------------------------------------------------------------------------
+  cd deploy/compose && docker compose up -d --build meeting-api
+
+
+================================================================================
+VERIFICATION (END TO END)
+================================================================================
+1. Apply the D1 schema; set CLOUDFLARE_D1_* env vars; CLOUDFLARE_D1_ENABLED=true.
+2. Rebuild/restart meeting-api; confirm no import/startup errors:
+     docker compose logs -f meeting-api
+3. Start a bot in a real Google Meet (Part 1, step 4) and speak ~1 minute.
+4. Watch meeting-api logs for:
+     "Stored N segments to PostgreSQL"  followed by
+     "Mirrored N segment(s) to Cloudflare D1"
+5. Query Vexa:   GET /transcripts/google_meet/<id>   -> segments exist locally.
+6. Query D1:
+     wrangler d1 execute <DB> --remote \
+       --command "SELECT count(*) AS n, max(created_at) AS latest FROM transcriptions"
+   Confirm same segments arrived (speaker/text/timestamps) and NO duplicates
+   (row count stable across repeated immutability flushes).
+7. Negative test: set a bad CF_API_TOKEN, run a meeting, confirm Postgres still
+   gets all segments and only a non-fatal D1 error is logged (proves the forward
+   can't break Vexa).
+
+
+================================================================================
+STATUS OF WORK ALREADY DONE
+================================================================================
+DONE (code complete + unit-verified):
+  - d1_forwarder.py, db_writer.py hook, config.py, docker-compose.yml,
+    env-example, deploy/cloudflare-d1/{schema.sql,README.md}.
+  - All Python files compile (py_compile).
+  - Offline unit tests pass: placeholder-count == params-count, 50-row chunking
+    (125 -> 50/50/25), segment_id-less rows skipped, NULL-safe stringified
+    params, enable/credential gating.
+  - D1 /query request shape confirmed against Cloudflare API docs.
+
+REMAINING (needs your accounts / hardware / a live meeting):
+  - Part 1 setup (Vexa token, make all, make setup-api-key).
+  - D1 database + API token creation, apply schema, set .env, rebuild meeting-api.
+  - End-to-end test with a real Google Meet.
+
+
+================================================================================
+OPTIONAL FOLLOW-UPS (not yet implemented; ask if you want them)
+================================================================================
+  - Wire the CF_* vars into the `make lite` single-container path.
+  - Redis-backed retry queue for guaranteed delivery (reuse the pattern in
+    webhook_retry_worker.py) instead of best-effort drop-on-failure.
+  - Switch to end-of-meeting batch export via POST_MEETING_HOOKS if real-time
+    per-segment writes are not wanted.
+  - Self-host Whisper (LOCAL_TRANSCRIPTION=true) for fully private STT (GPU/CPU).
+================================================================================

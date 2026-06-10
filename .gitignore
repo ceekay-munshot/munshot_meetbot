@@ -154,6 +154,7 @@ test_data/
 *.webm
 *.mp4
 *.txt
+!PLAN.txt
 !**/requirements.txt
 # v0.10.5.3 fix: hallucinations corpus files were silently dropped when
 # *.txt was added globally. The corpus is loaded by hallucination-filter.ts
@@ -178,4 +179,3 @@ tests3/.state-compose
 tests3/.state-helm
 # Suffixed snapshots from teardown / iteration captures contain the same credentials.
 tests3/.state-*
-
