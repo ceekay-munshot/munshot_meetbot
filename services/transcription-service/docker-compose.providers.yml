@@ -1,0 +1,41 @@
+# Cloud-provider mode: no GPU, no local Whisper model.
+# Forwards each chunk to Groq (primary) -> Deepgram (fallback).
+#
+# Usage:
+#   1. Put GROQ_API_KEY / DEEPGRAM_API_KEY in this directory's .env (or export them).
+#   2. docker compose -f docker-compose.providers.yml up -d --build
+#   3. Point the rest of the Vexa stack at it:
+#        TRANSCRIPTION_SERVICE_URL=http://transcription-service:8000
+#      (the service is aliased as `transcription-service` on vexa-network)
+services:
+  transcription-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: transcription-providers
+    ports:
+      - "8083:8000"
+    environment:
+      - WORKER_ID=1
+      # Provider routing (see providers.py)
+      - TRANSCRIPTION_PROVIDER=cloud
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GROQ_MODEL=${GROQ_MODEL:-whisper-large-v3-turbo}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+      - DEEPGRAM_MODEL=${DEEPGRAM_MODEL:-nova-3}
+      - PROVIDER_TIMEOUT_SECONDS=${PROVIDER_TIMEOUT_SECONDS:-30}
+      # Service auth token the bot/gateway must present (optional)
+      - API_TOKEN=${API_TOKEN:-}
+      # IO-bound forwarding: allow plenty of concurrent in-flight chunks
+      - MAX_ACTIVE_REQUESTS=${MAX_ACTIVE_REQUESTS:-50}
+      - FAIL_FAST_WHEN_BUSY=false
+    restart: unless-stopped
+    networks:
+      vexa-network:
+        aliases:
+          - transcription-service
+
+networks:
+  vexa-network:
+    external: true
+    name: vexa-network

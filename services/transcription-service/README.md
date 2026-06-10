@@ -14,6 +14,7 @@ Under the hood: faster-whisper behind an Nginx load balancer. Add workers to sca
 ## What
 
 - **OpenAI Whisper API compatible** (`/v1/audio/transcriptions`) -- works with any client that speaks the OpenAI audio API.
+- **Local or cloud** -- run faster-whisper locally, OR forward to cloud providers (Groq -> Deepgram) with no GPU.
 - **Load-balanced** -- Nginx distributes requests across workers using least-connections.
 - **Backpressure-aware** -- configurable fail-fast mode returns 503 when busy, letting callers buffer and retry.
 - **GPU and CPU** -- same codebase, different docker-compose files.
@@ -38,6 +39,32 @@ docker compose -f docker-compose.cpu.yml up -d
 # Watch logs until "Model loaded successfully"
 docker compose logs -f
 ```
+
+### Run (cloud providers, no GPU)
+
+Set `TRANSCRIPTION_PROVIDER=cloud` and the service forwards each chunk to
+**Groq Whisper** (primary, free tier) and falls back to **Deepgram** (paid) on
+any Groq failure (429 rate limit, 5xx, timeout, or missing/invalid key). The
+local Whisper model is not loaded, so no GPU is required. Speaker attribution
+stays with Vexa, so Deepgram diarization is intentionally not requested.
+
+```bash
+# Put GROQ_API_KEY / DEEPGRAM_API_KEY in .env (see .env.example), then:
+docker compose -f docker-compose.providers.yml up -d --build
+docker compose -f docker-compose.providers.yml logs -f   # expect "CLOUD provider mode"
+
+# Point the rest of the Vexa stack at it (aliased on vexa-network):
+#   TRANSCRIPTION_SERVICE_URL=http://transcription-service:8000
+```
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `TRANSCRIPTION_PROVIDER` | `local` | `cloud` enables Groq->Deepgram forwarding |
+| `GROQ_API_KEY` | — | Groq key (primary). Required for the Groq leg |
+| `GROQ_MODEL` | `whisper-large-v3-turbo` | Groq Whisper model |
+| `DEEPGRAM_API_KEY` | — | Deepgram key (fallback). Required for the Deepgram leg |
+| `DEEPGRAM_MODEL` | `nova-3` | Deepgram model |
+| `PROVIDER_TIMEOUT_SECONDS` | `30` | Per-provider HTTP timeout |
 
 The service listens on the port mapped in `docker-compose.yml` (default 8083:80).
 

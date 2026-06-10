@@ -15,6 +15,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY main.py .
+COPY providers.py .
 
 # Create models directory
 RUN mkdir -p /app/models
