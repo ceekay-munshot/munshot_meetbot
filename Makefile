@@ -4,6 +4,9 @@
        deploy validate provision teardown promote publish-packages helm-upgrade-safe \
        help
 
+# Pin bash so recipes don't break under a POSIX /bin/sh (dash/busybox).
+SHELL := /bin/bash
+
 # ═══ Deploy ═════════════════════════════════════════════════════
 
 all:                               ## full stack via Docker Compose

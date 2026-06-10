@@ -1,5 +1,9 @@
 .PHONY: all all-build env build build-bot-image build-transcript-rendering up down ps logs test test-transcription init-db restore-db check_docker preflight publish promote-staging promote-latest help-tags setup-api-key
 
+# Recipes use bash syntax (while/read, [[, arithmetic). Pin bash so they don't
+# break under a POSIX /bin/sh (dash on Debian/Ubuntu, busybox/ash elsewhere).
+SHELL := /bin/bash
+
 # --- Paths ---
 ROOT := $(shell git rev-parse --show-toplevel)
 COMPOSE_FILE := $(ROOT)/deploy/compose/docker-compose.yml
