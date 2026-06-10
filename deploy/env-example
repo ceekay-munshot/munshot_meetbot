@@ -58,6 +58,15 @@ MINIO_SECURE=false
 # Local GPU transcription (uncomment to self-host)
 # LOCAL_TRANSCRIPTION=true
 
+# Cloud STT providers (Groq primary -> Deepgram fallback), no GPU required.
+# Run services/transcription-service in provider mode:
+#   cd services/transcription-service
+#   GROQ_API_KEY=... DEEPGRAM_API_KEY=... \
+#     docker compose -f docker-compose.providers.yml up -d --build
+# Then point the stack at it (the service is aliased on vexa-network):
+#   TRANSCRIPTION_SERVICE_URL=http://transcription-service:8000
+# See services/transcription-service/.env.example for GROQ_*/DEEPGRAM_* options.
+
 # TTS uses Piper (local, no API key needed)
 # Voice models auto-download from HuggingFace on first use
 

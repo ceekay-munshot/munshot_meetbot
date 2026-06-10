@@ -20,6 +20,8 @@ import uvicorn
 from faster_whisper import WhisperModel
 # faster-whisper uses CTranslate2 internally (no PyTorch needed)
 
+import providers  # Cloud STT provider routing (Groq -> Deepgram)
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +32,10 @@ logger = logging.getLogger(__name__)
 # Configuration
 WORKER_ID = os.getenv("WORKER_ID", "1")
 MODEL_SIZE = os.getenv("MODEL_SIZE", "large-v3-turbo")
+
+# Cloud provider mode: when enabled, forward chunks to Groq -> Deepgram instead
+# of loading faster-whisper locally (see providers.py).
+CLOUD_MODE = providers.cloud_enabled()
 
 # Device detection: Use environment variable or default to cuda for GPU containers
 # CTranslate2 (used by faster-whisper) will automatically detect and use CUDA if available
@@ -211,6 +217,14 @@ async def startup_event():
     """Initialize Whisper model on startup"""
     global model
     logger.info(f"Worker {WORKER_ID} starting up...")
+
+    if CLOUD_MODE:
+        logger.info(
+            f"Worker {WORKER_ID} running in CLOUD provider mode "
+            f"(skipping local Whisper model load): {providers.provider_status()}"
+        )
+        return
+
     logger.info(f"Device: {DEVICE}, Model: {MODEL_SIZE}, Compute: {COMPUTE_TYPE}")
     logger.info(
         "Quality params - "
@@ -248,6 +262,16 @@ async def startup_event():
 @app.get("/health")
 async def health_check():
     """Health check endpoint for load balancer"""
+    if CLOUD_MODE:
+        # No local model in cloud mode; the service is ready as soon as it boots.
+        return {
+            "status": "healthy",
+            "worker_id": WORKER_ID,
+            "timestamp": datetime.utcnow().isoformat(),
+            "mode": "cloud",
+            "providers": providers.provider_status(),
+        }
+
     health_status = {
         "status": "healthy" if model is not None else "unhealthy",
         "worker_id": WORKER_ID,
@@ -365,7 +389,31 @@ async def transcribe_audio(
         # Read audio file
         audio_bytes = await file.read()
         logger.info(f"Worker {WORKER_ID} read {len(audio_bytes)} bytes of audio data")
-        
+
+        # Cloud provider mode: forward the raw chunk to Groq -> Deepgram and
+        # return their normalized result. No local decode/model needed.
+        if CLOUD_MODE:
+            try:
+                result = await providers.transcribe_via_providers(
+                    audio_bytes=audio_bytes,
+                    filename=file.filename or "audio.wav",
+                    content_type=file.content_type or "audio/wav",
+                    language=language,
+                    prompt=prompt,
+                    temperature=float(temperature) if temperature else 0.0,
+                )
+            except providers.AllProvidersFailed as e:
+                logger.error(f"Worker {WORKER_ID} all cloud providers failed: {e}")
+                raise HTTPException(status_code=502, detail=f"All STT providers failed: {e}")
+
+            processing_time = time.time() - start_time
+            logger.info(
+                f"Worker {WORKER_ID} cloud transcription completed in {processing_time:.2f}s "
+                f"via {result.get('provider')} - segments: {len(result.get('segments', []))}, "
+                f"language: {result.get('language')}"
+            )
+            return result
+
         # Convert to format suitable for faster-whisper
         # Use soundfile to properly decode audio formats (WAV, MP3, etc.)
         # Falls back to ffmpeg subprocess for formats soundfile can't handle (webm, opus, etc.)
@@ -558,6 +606,18 @@ async def transcribe_audio(
 @app.get("/")
 async def root():
     """Root endpoint with service info"""
+    if CLOUD_MODE:
+        return {
+            "service": "Vexa Transcription Service",
+            "worker_id": WORKER_ID,
+            "mode": "cloud",
+            "providers": providers.provider_status(),
+            "status": "ready",
+            "endpoints": {
+                "transcribe": "/v1/audio/transcriptions",
+                "health": "/health"
+            }
+        }
     return {
         "service": "Vexa Transcription Service",
         "worker_id": WORKER_ID,
