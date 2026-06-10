@@ -60,8 +60,8 @@ export async function GET(request: NextRequest) {
     || process.env.VEXA_API_KEY
     || null;
 
-  // Get default bot name from environment (optional)
-  const defaultBotName = process.env.DEFAULT_BOT_NAME || null;
+  // Get default bot name from environment (optional); fall back to product default
+  const defaultBotName = process.env.DEFAULT_BOT_NAME || "Munshot Notetaker";
 
   // Hosted mode flags (read at runtime, not build time)
   const hostedMode = process.env.NEXT_PUBLIC_HOSTED_MODE === "true";

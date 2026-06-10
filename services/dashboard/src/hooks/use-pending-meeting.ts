@@ -43,7 +43,8 @@ export function usePendingMeeting() {
     if (parsed.originalUrl) {
       request.meeting_url = parsed.originalUrl;
     }
-    request.bot_name = "Vexa - Open Source Bot";
+    // Omit bot_name: this auto-join effect can run before /api/config resolves,
+    // so let the meeting API apply its default (which honors DEFAULT_BOT_NAME).
 
     toast.promise(
       vexaAPI.createBot(request).then((meeting) => {

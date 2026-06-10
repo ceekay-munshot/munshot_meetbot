@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { Video, Loader2, Check, AlertCircle, Sparkles, Mic, UserCheck } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -37,10 +37,26 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
   const [passcode, setPasscode] = useState("");
   const [botName, setBotName] = useState(() => {
     if (typeof window !== "undefined") {
-      return localStorage.getItem("vexa-join-bot-name") || "Vexa";
+      return localStorage.getItem("vexa-join-bot-name") || "";
     }
-    return "Vexa";
+    return "";
   });
+  // Seed the field with the runtime default (DEFAULT_BOT_NAME) once /api/config
+  // resolves. config loads asynchronously, so the initial state can't depend on
+  // it; without this, a first-time user (no saved name) would keep the build-time
+  // fallback and the configured default would never be applied.
+  const botNameSeededRef = useRef(false);
+  useEffect(() => {
+    if (botNameSeededRef.current) return;
+    if (typeof window !== "undefined" && localStorage.getItem("vexa-join-bot-name")) {
+      botNameSeededRef.current = true;
+      return;
+    }
+    if (config?.defaultBotName) {
+      setBotName((cur) => cur || config.defaultBotName!);
+      botNameSeededRef.current = true;
+    }
+  }, [config?.defaultBotName]);
   const [language, setLanguage] = useState("auto");
   const [transcribeEnabled, setTranscribeEnabled] = useState(true);
   const [authenticated, setAuthenticated] = useState(false);
@@ -104,7 +120,7 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
     }
 
     // Set bot name - use custom name or configured default
-    request.bot_name = botName.trim() || config?.defaultBotName || "Vexa";
+    request.bot_name = botName.trim() || config?.defaultBotName || "Munshot Notetaker";
 
     // Persist to localStorage
     if (typeof window !== "undefined") {
