@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { Video, Loader2, Check, AlertCircle, Sparkles, Mic, UserCheck } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { vexaAPI } from "@/lib/api";
 import { useLiveStore } from "@/stores/live-store";
-import { useRuntimeConfig, getDefaultBotName } from "@/hooks/use-runtime-config";
+import { useRuntimeConfig } from "@/hooks/use-runtime-config";
 import type { Platform, CreateBotRequest } from "@/types/vexa";
 import { PLATFORM_CONFIG } from "@/types/vexa";
 import { LanguagePicker } from "@/components/language-picker";
@@ -37,10 +37,26 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
   const [passcode, setPasscode] = useState("");
   const [botName, setBotName] = useState(() => {
     if (typeof window !== "undefined") {
-      return localStorage.getItem("vexa-join-bot-name") || getDefaultBotName();
+      return localStorage.getItem("vexa-join-bot-name") || "";
     }
-    return getDefaultBotName();
+    return "";
   });
+  // Seed the field with the runtime default (DEFAULT_BOT_NAME) once /api/config
+  // resolves. config loads asynchronously, so the initial state can't depend on
+  // it; without this, a first-time user (no saved name) would keep the build-time
+  // fallback and the configured default would never be applied.
+  const botNameSeededRef = useRef(false);
+  useEffect(() => {
+    if (botNameSeededRef.current) return;
+    if (typeof window !== "undefined" && localStorage.getItem("vexa-join-bot-name")) {
+      botNameSeededRef.current = true;
+      return;
+    }
+    if (config?.defaultBotName) {
+      setBotName((cur) => cur || config.defaultBotName!);
+      botNameSeededRef.current = true;
+    }
+  }, [config?.defaultBotName]);
   const [language, setLanguage] = useState("auto");
   const [transcribeEnabled, setTranscribeEnabled] = useState(true);
   const [authenticated, setAuthenticated] = useState(false);
