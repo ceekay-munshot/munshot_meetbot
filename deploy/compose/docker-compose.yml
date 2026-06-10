@@ -292,6 +292,8 @@ services:
       - TRANSCRIPTION_GATEWAY_URL=${TRANSCRIPTION_GATEWAY_URL:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Default bot display name when a request omits bot_name
+      - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-Munshot Notetaker}
       # Cloudflare D1 transcript mirror (best-effort; off unless ENABLED=true)
       - CLOUDFLARE_D1_ENABLED=${CLOUDFLARE_D1_ENABLED:-false}
       - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
@@ -378,6 +380,7 @@ services:
       - VEXA_ALLOW_DIRECT_LOGIN=${VEXA_ALLOW_DIRECT_LOGIN:-true}
       - MINIO_INTERNAL_ENDPOINT=${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-}
+      - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-Munshot Notetaker}
     init: true
     depends_on:
       - api-gateway

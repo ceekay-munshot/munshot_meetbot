@@ -67,6 +67,9 @@ MINIO_SECURE=false
 #   TRANSCRIPTION_SERVICE_URL=http://transcription-service:8000
 # See services/transcription-service/.env.example for GROQ_*/DEEPGRAM_* options.
 
+# Bot display name shown in meetings (override anytime; default: Munshot Notetaker)
+# DEFAULT_BOT_NAME=Munshot Notetaker
+
 # TTS uses Piper (local, no API key needed)
 # Voice models auto-download from HuggingFace on first use
 

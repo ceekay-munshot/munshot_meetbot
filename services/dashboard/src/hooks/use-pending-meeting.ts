@@ -10,6 +10,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useLiveStore } from "@/stores/live-store";
 import { useMeetingsStore } from "@/stores/meetings-store";
 import { getUserFriendlyError } from "@/lib/error-messages";
+import { getDefaultBotName } from "@/hooks/use-runtime-config";
 import type { CreateBotRequest } from "@/types/vexa";
 
 export function usePendingMeeting() {
@@ -43,7 +44,7 @@ export function usePendingMeeting() {
     if (parsed.originalUrl) {
       request.meeting_url = parsed.originalUrl;
     }
-    request.bot_name = "Vexa - Open Source Bot";
+    request.bot_name = getDefaultBotName();
 
     toast.promise(
       vexaAPI.createBot(request).then((meeting) => {

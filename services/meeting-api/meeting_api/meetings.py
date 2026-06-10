@@ -1080,7 +1080,7 @@ async def request_bot(
         "meeting_id": meeting_id,
         "platform": req.platform.value,
         "meetingUrl": constructed_url,
-        "botName": req.bot_name or f"VexaBot-{uuid_lib.uuid4().hex[:6]}",
+        "botName": req.bot_name or os.getenv("DEFAULT_BOT_NAME") or f"Munshot-{uuid_lib.uuid4().hex[:6]}",
         "token": meeting_token,
         "nativeMeetingId": native_meeting_id,
         "connectionId": connection_id,
