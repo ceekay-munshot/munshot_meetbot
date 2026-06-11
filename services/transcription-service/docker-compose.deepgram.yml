@@ -1,0 +1,38 @@
+# Deepgram-only cloud transcription (no GPU, no Groq).
+# Joins the running stack's network (vexa_vexa) and is aliased as
+# `transcription-service` so meeting-api / runtime-api / bots resolve it.
+#
+# Usage (DEEPGRAM_API_KEY is read from the repo-root .env or the environment):
+#   docker compose -f docker-compose.deepgram.yml up -d --build
+#   docker compose -f docker-compose.deepgram.yml logs -f    # live logs
+#   Docs:  http://<host-ip>:8083/docs
+services:
+  transcription-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: transcription-deepgram
+    ports:
+      # LAN-reachable FastAPI docs / OpenAI-compatible endpoint.
+      - "0.0.0.0:8083:8000"
+    environment:
+      - WORKER_ID=1
+      - TRANSCRIPTION_PROVIDER=cloud
+      - DEEPGRAM_ONLY=true
+      # NOTE: GROQ_API_KEY is intentionally NOT passed here.
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+      - DEEPGRAM_MODEL=${DEEPGRAM_MODEL:-nova-3}
+      - PROVIDER_TIMEOUT_SECONDS=${PROVIDER_TIMEOUT_SECONDS:-30}
+      # No API_TOKEN -> service accepts all requests (testing only).
+      - MAX_ACTIVE_REQUESTS=${MAX_ACTIVE_REQUESTS:-50}
+      - FAIL_FAST_WHEN_BUSY=false
+    restart: unless-stopped
+    networks:
+      vexa_vexa:
+        aliases:
+          - transcription-service
+
+networks:
+  vexa_vexa:
+    external: true
+    name: vexa_vexa

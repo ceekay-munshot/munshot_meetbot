@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import redis.asyncio as aioredis
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import and_, desc, func, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -1262,6 +1262,58 @@ async def request_bot(
         await db.refresh(new_meeting)
 
     return MeetingResponse.model_validate(new_meeting)
+
+
+class QuickJoinRequest(BaseModel):
+    """Minimal payload for the quick-join convenience endpoint.
+
+    Just a display name + a meeting link. Platform, native_meeting_id and
+    passcode are derived from the URL by MeetingCreate's
+    parse_meeting_url_if_provided validator (Google Meet / Zoom / Teams).
+    """
+    model_config = {"extra": "ignore"}
+
+    name: str = Field(..., description="Name the bot displays in the meeting")
+    url: str = Field(..., description="Meeting join link (Google Meet, Zoom, or Teams)")
+
+
+@router.post(
+    "/bots/join",
+    response_model=MeetingResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a bot to a meeting from just a name + join link",
+    dependencies=[Depends(get_user_and_token)],
+)
+async def quick_join_bot(
+    body: QuickJoinRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    auth_data: tuple = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Convenience wrapper over POST /bots.
+
+    Accepts only {name, url}. The URL is parsed to extract platform +
+    native_meeting_id (+ passcode for Teams); everything else uses the same
+    defaults as the full /bots endpoint. For unrecognised/white-label URLs
+    that need an explicit platform (or Teams without an embedded passcode),
+    use POST /bots directly.
+    """
+    try:
+        req = MeetingCreate(meeting_url=body.url, bot_name=body.name)
+    except ValidationError as e:
+        # Surface the first validation message (e.g. malformed URL, or a
+        # recognised-but-unsupported URL shape that yields no platform).
+        msg = e.errors()[0].get("msg", "Invalid meeting URL") if e.errors() else "Invalid meeting URL"
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg)
+
+    return await request_bot(
+        req=req,
+        request=request,
+        background_tasks=background_tasks,
+        auth_data=auth_data,
+        db=db,
+    )
 
 
 @router.post("/internal/browser-sessions/{token}/save")

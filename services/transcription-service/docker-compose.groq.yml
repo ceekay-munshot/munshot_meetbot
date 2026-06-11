@@ -1,0 +1,37 @@
+# Groq-only cloud transcription (no GPU, no Deepgram fallback).
+# Joins the running stack's network (vexa_vexa) and is aliased as
+# `transcription-service` so meeting-api / runtime-api / bots resolve it.
+#
+# Usage (GROQ_API_KEY is read from the repo-root .env or the environment):
+#   docker compose -f docker-compose.groq.yml up -d --build
+#   docker compose -f docker-compose.groq.yml logs -f      # live logs
+#   Docs:  http://<host-ip>:8083/docs
+services:
+  transcription-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: transcription-groq
+    ports:
+      # LAN-reachable FastAPI docs / OpenAI-compatible endpoint.
+      - "0.0.0.0:8083:8000"
+    environment:
+      - WORKER_ID=1
+      - TRANSCRIPTION_PROVIDER=cloud
+      - GROQ_ONLY=true
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GROQ_MODEL=${GROQ_MODEL:-whisper-large-v3-turbo}
+      - PROVIDER_TIMEOUT_SECONDS=${PROVIDER_TIMEOUT_SECONDS:-30}
+      # No API_TOKEN -> service accepts all requests (testing only).
+      - MAX_ACTIVE_REQUESTS=${MAX_ACTIVE_REQUESTS:-50}
+      - FAIL_FAST_WHEN_BUSY=false
+    restart: unless-stopped
+    networks:
+      vexa_vexa:
+        aliases:
+          - transcription-service
+
+networks:
+  vexa_vexa:
+    external: true
+    name: vexa_vexa

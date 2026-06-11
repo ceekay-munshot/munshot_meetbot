@@ -68,6 +68,16 @@ DEEPGRAM_MODEL = _env("DEEPGRAM_MODEL", "nova-3")
 # --- Shared ------------------------------------------------------------------
 PROVIDER_TIMEOUT_SECONDS = _env_float("PROVIDER_TIMEOUT_SECONDS", 30.0)
 
+# When true, use Groq only and skip the Deepgram fallback entirely. Groq errors
+# surface directly instead of being swallowed in favour of the fallback. Handy
+# for testing the Groq path in isolation.
+GROQ_ONLY = _env("GROQ_ONLY", "false").lower() in {"1", "true", "yes", "on"}
+
+# When true, use Deepgram only and skip Groq entirely (even if GROQ_API_KEY is
+# set in the environment). Deepgram errors surface directly. Mirror of GROQ_ONLY
+# for testing the Deepgram path in isolation.
+DEEPGRAM_ONLY = _env("DEEPGRAM_ONLY", "false").lower() in {"1", "true", "yes", "on"}
+
 
 class AllProvidersFailed(Exception):
     """Raised when every configured cloud provider failed for a chunk."""
@@ -261,28 +271,36 @@ async def transcribe_via_providers(
     errors: List[str] = []
 
     async with httpx.AsyncClient(timeout=PROVIDER_TIMEOUT_SECONDS) as client:
-        # 1. Groq (primary)
-        if GROQ_API_KEY:
-            try:
-                return await _transcribe_via_groq(
-                    client, audio_bytes, filename, content_type,
-                    language, prompt, temperature,
-                )
-            except Exception as e:
-                detail = _describe_http_error(e)
-                logger.warning(f"Groq transcription failed, falling back to Deepgram: {detail}")
-                errors.append(f"groq: {detail}")
-        else:
-            errors.append("groq: GROQ_API_KEY not set")
+        # 1. Groq (primary) — skipped entirely when DEEPGRAM_ONLY is set.
+        if not DEEPGRAM_ONLY:
+            if GROQ_API_KEY:
+                try:
+                    return await _transcribe_via_groq(
+                        client, audio_bytes, filename, content_type,
+                        language, prompt, temperature,
+                    )
+                except Exception as e:
+                    detail = _describe_http_error(e)
+                    if GROQ_ONLY:
+                        logger.error(f"Groq transcription failed (GROQ_ONLY, no fallback): {detail}")
+                        raise AllProvidersFailed(f"groq: {detail}")
+                    logger.warning(f"Groq transcription failed, falling back to Deepgram: {detail}")
+                    errors.append(f"groq: {detail}")
+            else:
+                errors.append("groq: GROQ_API_KEY not set")
 
-        # 2. Deepgram (fallback)
-        if DEEPGRAM_API_KEY:
+        # 2. Deepgram (fallback, or sole provider when DEEPGRAM_ONLY) —
+        #    skipped when GROQ_ONLY is set.
+        if DEEPGRAM_API_KEY and not GROQ_ONLY:
             try:
                 return await _transcribe_via_deepgram(
                     client, audio_bytes, content_type, language,
                 )
             except Exception as e:
                 detail = _describe_http_error(e)
+                if DEEPGRAM_ONLY:
+                    logger.error(f"Deepgram transcription failed (DEEPGRAM_ONLY, no fallback): {detail}")
+                    raise AllProvidersFailed(f"deepgram: {detail}")
                 logger.error(f"Deepgram transcription failed: {detail}")
                 errors.append(f"deepgram: {detail}")
         else:
