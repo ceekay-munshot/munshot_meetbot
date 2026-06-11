@@ -39,3 +39,9 @@ CF_D1_DATABASE_ID = os.environ.get("CF_D1_DATABASE_ID", "")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 CF_D1_TABLE = os.environ.get("CF_D1_TABLE", "transcriptions")
 CF_D1_TIMEOUT_SECONDS = float(os.environ.get("CF_D1_TIMEOUT_SECONDS", "10"))
+
+# Meetings mirror table — meeting-level state for Cloudflare-side dashboard
+# reads (status, lifecycle timestamps, segment counts, terminal classification).
+# Uses the same enable switch + credentials as the transcript mirror above.
+# See deploy/cloudflare-d1/schema_meetings.sql.
+CF_D1_MEETINGS_TABLE = os.environ.get("CF_D1_MEETINGS_TABLE", "meetings")

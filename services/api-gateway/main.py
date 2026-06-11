@@ -291,6 +291,11 @@ async def forward_request(client: httpx.AsyncClient, method: str, url: str, requ
     headers = {k.lower(): v for k, v in request.headers.items() if k.lower() not in excluded_headers}
 
     # Security: strip any client-supplied identity headers (prevent spoofing)
+    # Note: Cloudflare Worker / BFF integrations supply per-meeting webhook
+    # config via the JSON request body on POST /bots (webhook_url, webhook_secret,
+    # webhook_events) — NOT via these headers. The body is forwarded unchanged
+    # below; meeting-api validates and stores it on meeting.data. See
+    # docs/cloudflare-worker-integration.md.
     for h in ["x-user-id", "x-user-scopes", "x-user-limits",
               "x-user-webhook-url", "x-user-webhook-secret", "x-user-webhook-events"]:
         headers.pop(h, None)
