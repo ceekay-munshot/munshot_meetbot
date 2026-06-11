@@ -1,12 +1,30 @@
-# Cloudflare D1 transcript mirror
+# Cloudflare D1 mirror
 
-Forwards every **finalized** transcript segment that Vexa writes to Postgres into a
-Cloudflare D1 database as well. It hooks into the existing
-`process_redis_to_postgres` loop (`services/meeting-api/meeting_api/collector/db_writer.py`),
-so it inherits Vexa's immutability window, speaker mapping, and `segment_id`
-deduplication. The forward is **best-effort**: if D1 is unreachable or rejects the
-write, Postgres stays authoritative and the meeting is unaffected (the error is logged
-and skipped).
+Two best-effort mirrors run against the same D1 database:
+
+1. **Transcript segments** — every finalized segment Vexa writes to Postgres is
+   also forwarded to D1. Hooks into `process_redis_to_postgres`
+   (`services/meeting-api/meeting_api/collector/db_writer.py`) and inherits the
+   immutability window, speaker mapping, and `segment_id` dedupe.
+2. **Meeting state** — meeting metadata + lifecycle state (status,
+   timestamps, completion_reason, failure_stage, segment_count). Hooks into
+   `POST /bots`, the bot callback handlers, and the post-meeting task runner
+   so Cloudflare-side dashboards can answer "what meetings exist for a user,
+   what is their status, basic metadata, terminal outcome" without round-
+   tripping to AWS for every read. Implementation:
+   `services/meeting-api/meeting_api/collector/d1_meeting_forwarder.py`.
+
+Both are **best-effort**: if D1 is unreachable, rejects the write, or is
+misconfigured, Postgres stays authoritative and meeting creation /
+transcription / callbacks are unaffected (the error is logged and skipped).
+
+**Recordings are NOT mirrored.** Cloudflare callers fetch recording metadata
+and download URLs directly from the AWS REST endpoints under `/recordings/*`.
+See `docs/cloudflare-worker-integration.md`.
+
+**Secrets are NOT mirrored.** The meeting forwarder explicitly excludes
+`webhook_url`, `webhook_secret`, `webhook_events` and any other credentials
+from the snapshot.
 
 ## One-time setup
 
@@ -14,9 +32,10 @@ and skipped).
    `wrangler d1 create vexa-transcripts`). Note the **database ID** and your
    **account ID**.
 
-2. **Apply the schema:**
+2. **Apply both schemas:**
    ```bash
    wrangler d1 execute vexa-transcripts --remote --file deploy/cloudflare-d1/schema.sql
+   wrangler d1 execute vexa-transcripts --remote --file deploy/cloudflare-d1/schema_meetings.sql
    ```
 
 3. **Create an API token** (My Profile → API Tokens) with the **D1 Edit**
@@ -29,6 +48,7 @@ and skipped).
    CF_D1_DATABASE_ID=<your-d1-database-id>
    CF_API_TOKEN=<your-d1-api-token>
    CF_D1_TABLE=transcriptions          # optional, this is the default
+   CF_D1_MEETINGS_TABLE=meetings       # optional, this is the default
    ```
 
 5. **Rebuild & restart meeting-api:**
@@ -63,5 +83,6 @@ becomes a no-op; nothing else changes.
 | `CF_ACCOUNT_ID` | — | Cloudflare account ID. |
 | `CF_D1_DATABASE_ID` | — | Target D1 database ID. |
 | `CF_API_TOKEN` | — | API token with D1 Edit permission. |
-| `CF_D1_TABLE` | `transcriptions` | Destination table name. |
+| `CF_D1_TABLE` | `transcriptions` | Transcript destination table name. |
+| `CF_D1_MEETINGS_TABLE` | `meetings` | Meeting-state destination table name. |
 | `CF_D1_TIMEOUT_SECONDS` | `10` | HTTP timeout per D1 request. |

@@ -51,6 +51,7 @@ from .config import (
     BOT_STOP_DELAY_SECONDS,
 )
 from .post_meeting import run_all_tasks, run_status_webhook_task
+from .collector.d1_meeting_forwarder import safe_mirror_meeting as _d1_safe_mirror_meeting
 
 logger = logging.getLogger("meeting_api.meetings")
 
@@ -981,18 +982,55 @@ async def request_bot(
     else:
         meeting_data["recording_enabled"] = os.getenv("RECORDING_ENABLED", "true").lower() == "true"
 
-    # Store webhook config in meeting.data (from gateway headers or user config)
-    webhook_url = request.headers.get("X-User-Webhook-URL", "")
-    if webhook_url:
-        meeting_data["webhook_url"] = webhook_url
-        webhook_secret = request.headers.get("X-User-Webhook-Secret", "")
-        if webhook_secret:
-            meeting_data["webhook_secret"] = webhook_secret
-        webhook_events_raw = request.headers.get("X-User-Webhook-Events", "")
-        if webhook_events_raw:
-            meeting_data["webhook_events"] = {
-                evt.strip(): True for evt in webhook_events_raw.split(",") if evt.strip()
-            }
+    # Webhook config resolution order (highest precedence first):
+    #   1. Per-meeting fields on the request body (req.webhook_url/secret/events).
+    #      This is the Cloudflare Worker / BFF integration path — the edge
+    #      knows the webhook target without round-tripping through PUT /user/webhook.
+    #   2. Gateway-injected X-User-Webhook-* headers, which the API gateway
+    #      sources from the resolved token/user record (legacy + still default).
+    # If the body supplies webhook_url we use the body trio in full (do NOT mix
+    # a body URL with a header secret — secrets belong to whoever owns the URL).
+    body_webhook_url = (req.webhook_url or "").strip() if req.webhook_url else ""
+    if body_webhook_url:
+        # SSRF-safe validation. Same validator used by PUT /user/webhook +
+        # delivery sites. Raises 422 with the validator's user-friendly message.
+        from .webhook_url import validate_webhook_url
+        try:
+            validate_webhook_url(body_webhook_url)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid webhook_url: {e}",
+            )
+        meeting_data["webhook_url"] = body_webhook_url
+        if req.webhook_secret and req.webhook_secret.strip():
+            meeting_data["webhook_secret"] = req.webhook_secret.strip()
+        if req.webhook_events and isinstance(req.webhook_events, dict):
+            # Only positive opt-ins are stored, matching the gateway-header shape.
+            enabled = {evt: True for evt, on in req.webhook_events.items() if on}
+            if enabled:
+                meeting_data["webhook_events"] = enabled
+    else:
+        # Fall back to gateway-injected headers (user-level default webhook).
+        webhook_url = request.headers.get("X-User-Webhook-URL", "")
+        if webhook_url:
+            meeting_data["webhook_url"] = webhook_url
+            webhook_secret = request.headers.get("X-User-Webhook-Secret", "")
+            if webhook_secret:
+                meeting_data["webhook_secret"] = webhook_secret
+            webhook_events_raw = request.headers.get("X-User-Webhook-Events", "")
+            if webhook_events_raw:
+                meeting_data["webhook_events"] = {
+                    evt.strip(): True for evt in webhook_events_raw.split(",") if evt.strip()
+                }
+
+    # Persist a few analytics-friendly fields on meeting.data so the D1
+    # meetings mirror can render them without a separate column lookup.
+    # These do not change auth/security behavior; they're metadata.
+    if req.bot_name:
+        meeting_data["bot_name"] = req.bot_name
+    if req.language:
+        meeting_data["language"] = req.language
 
     new_meeting = Meeting(
         user_id=current_user.id,
@@ -1005,6 +1043,11 @@ async def request_bot(
     await db.commit()
     await db.refresh(new_meeting)
     meeting_id = new_meeting.id
+
+    # Best-effort mirror to Cloudflare D1 meetings table. Schedule in the
+    # background so the create-bot response is not held by a remote HTTP
+    # call. The mirror catches all errors internally — never breaks creation.
+    background_tasks.add_task(_d1_safe_mirror_meeting, new_meeting)
 
     # Publish initial status
     try:
@@ -2177,10 +2220,21 @@ async def transcribe_meeting(
         db.add(t)
         stored += 1
 
-    # 8. Update meeting.data with transcribed_at timestamp
+    # 8. Update meeting.data with transcribed_at timestamp + segment_count
     meeting_data["transcribed_at"] = datetime.utcnow().isoformat()
+    # segment_count is mirrored to D1 as a quick "does this meeting have a
+    # transcript?" signal for Cloudflare-side dashboards.
+    meeting_data["segment_count"] = int(stored)
     meeting.data = meeting_data
     await db.commit()
+    await db.refresh(meeting)
+
+    # Best-effort D1 meeting mirror — bumps segment_count so Cloudflare-side
+    # reads see "transcript-ready" without polling AWS. Non-fatal.
+    try:
+        await _d1_safe_mirror_meeting(meeting)
+    except Exception:
+        pass
 
     speakers = list(set(seg.get("speaker", "Unknown") for seg in segments if seg.get("text", "").strip()))
     logger.info(f"Deferred transcription for meeting {meeting_id}: {stored} segments, speakers={speakers}")
