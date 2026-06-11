@@ -18,6 +18,8 @@ Vexa's own speaker mapping, so Deepgram diarization is intentionally NOT request
 """
 import os
 import math
+import random
+import asyncio
 import logging
 from typing import Optional, List, Dict, Any
 
@@ -38,6 +40,17 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         logger.warning(f"Invalid float env {name}={raw!r}, using default {default}")
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid int env {name}={raw!r}, using default {default}")
         return default
 
 
@@ -67,6 +80,19 @@ DEEPGRAM_MODEL = _env("DEEPGRAM_MODEL", "nova-3")
 
 # --- Shared ------------------------------------------------------------------
 PROVIDER_TIMEOUT_SECONDS = _env_float("PROVIDER_TIMEOUT_SECONDS", 30.0)
+
+# Transient failures (network blip, timeout, rate-limit 429, 5xx) are retried
+# in-process with exponential backoff so a brief hiccup never bubbles up as a
+# 502 / dropped chunk mid-meeting. Deterministic errors (4xx other than 429)
+# are NOT retried — they'd just fail identically. Kept small so real-time
+# chunks don't stack latency under a sustained outage (upstream retries too).
+PROVIDER_MAX_RETRIES = _env_int("PROVIDER_MAX_RETRIES", 2)
+PROVIDER_RETRY_BACKOFF_SECONDS = _env_float("PROVIDER_RETRY_BACKOFF_SECONDS", 0.5)
+
+# Groq's Whisper API rejects any prompt longer than 896 characters with an
+# HTTP 400 (deterministic — every retry fails identically). Whisper uses the
+# prompt as trailing context, so we keep the tail (most recent words).
+GROQ_MAX_PROMPT_CHARS = _env_int("GROQ_MAX_PROMPT_CHARS", 896)
 
 # When true, use Groq only and skip the Deepgram fallback entirely. Groq errors
 # surface directly instead of being swallowed in favour of the fallback. Handy
@@ -214,6 +240,10 @@ async def _transcribe_via_groq(
     if language:
         form["language"] = language
     if prompt:
+        # Groq caps the prompt at GROQ_MAX_PROMPT_CHARS; keep the tail so the
+        # most recent context survives instead of 400-ing the whole request.
+        if len(prompt) > GROQ_MAX_PROMPT_CHARS:
+            prompt = prompt[-GROQ_MAX_PROMPT_CHARS:]
         form["prompt"] = prompt
 
     resp = await client.post(
@@ -275,9 +305,12 @@ async def transcribe_via_providers(
         if not DEEPGRAM_ONLY:
             if GROQ_API_KEY:
                 try:
-                    return await _transcribe_via_groq(
-                        client, audio_bytes, filename, content_type,
-                        language, prompt, temperature,
+                    return await _with_retries(
+                        "groq",
+                        lambda: _transcribe_via_groq(
+                            client, audio_bytes, filename, content_type,
+                            language, prompt, temperature,
+                        ),
                     )
                 except Exception as e:
                     detail = _describe_http_error(e)
@@ -293,8 +326,11 @@ async def transcribe_via_providers(
         #    skipped when GROQ_ONLY is set.
         if DEEPGRAM_API_KEY and not GROQ_ONLY:
             try:
-                return await _transcribe_via_deepgram(
-                    client, audio_bytes, content_type, language,
+                return await _with_retries(
+                    "deepgram",
+                    lambda: _transcribe_via_deepgram(
+                        client, audio_bytes, content_type, language,
+                    ),
                 )
             except Exception as e:
                 detail = _describe_http_error(e)
@@ -307,6 +343,39 @@ async def transcribe_via_providers(
             errors.append("deepgram: DEEPGRAM_API_KEY not set")
 
     raise AllProvidersFailed("; ".join(errors) or "no providers configured")
+
+
+def _is_transient_error(e: Exception) -> bool:
+    """True for failures worth retrying: network/timeout/protocol errors, plus
+    HTTP 429 (rate limit) and 5xx. Deterministic 4xx (bad request, auth, payload
+    too large) returns False — retrying would just reproduce the same failure."""
+    if isinstance(e, httpx.HTTPStatusError):
+        sc = e.response.status_code if e.response is not None else 0
+        return sc == 429 or sc >= 500
+    # httpx.TimeoutException is a subclass of TransportError, so this covers
+    # timeouts, ConnectError, ReadError, RemoteProtocolError, etc.
+    return isinstance(e, httpx.TransportError)
+
+
+async def _with_retries(label: str, coro_factory):
+    """Await coro_factory(), retrying transient failures with exponential
+    backoff + jitter up to PROVIDER_MAX_RETRIES. Deterministic errors raise
+    immediately. The final attempt's exception propagates to the caller."""
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except Exception as e:
+            attempt += 1
+            if attempt > PROVIDER_MAX_RETRIES or not _is_transient_error(e):
+                raise
+            delay = PROVIDER_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            delay += random.uniform(0, PROVIDER_RETRY_BACKOFF_SECONDS)
+            logger.warning(
+                f"{label} transient failure (attempt {attempt}/{PROVIDER_MAX_RETRIES}), "
+                f"retrying in {delay:.2f}s: {_describe_http_error(e)}"
+            )
+            await asyncio.sleep(delay)
 
 
 def _describe_http_error(e: Exception) -> str:
