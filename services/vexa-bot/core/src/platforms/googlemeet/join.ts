@@ -163,19 +163,32 @@ export async function joinGoogleMeeting(
     }
 
     // Authenticated users may see different buttons:
-    // - "Join now" — standard authenticated join
+    // - "Join now" — notetaker is recognized (same-org / quick access) → no knock
     // - "Switch here" — same account already in the meeting
-    // - "Ask to join" — cookies didn't load (fallback to anonymous)
+    // - "Ask to join" — notetaker is NOT auto-admitted for this meeting and must
+    //   knock (the host admits). This is normal for external/client-owned meets,
+    //   NOT a sign-in failure. The signed-in identity is still used.
     const joinNowSelector = 'button:has-text("Join now")';
     const switchHereSelector = 'button:has-text("Switch here")';
-    const askToJoinSelector = googleJoinButtonSelectors[0];
+    // "Ask to join" renders WITH an aria-label in current Google DOM, so the
+    // locale-agnostic googleJoinButtonSelectors[0] (`:not([aria-label])`) misses
+    // it — match it explicitly by text so we knock instead of timing out. We do
+    // NOT include the generic jsname selector here: it also matches "Join now"
+    // and would steal the race, routing no-knock meetings down the knock path.
+    const askToJoinSelectors = [
+      'button:has-text("Ask to join")',
+      'xpath=//button[.//span[text()="Ask to join"]]',
+    ];
 
     try {
-      // Race: wait for any join button
+      // Race: wait for any join button. join_now/switch_here win when present
+      // (no-knock); otherwise the explicit "Ask to join" matchers resolve.
       const joinButton = await Promise.race([
         page.waitForSelector(joinNowSelector, { timeout: 30000 }).then(el => ({ el, type: 'join_now' as const })),
         page.waitForSelector(switchHereSelector, { timeout: 30000 }).then(el => ({ el, type: 'switch_here' as const })),
-        page.waitForSelector(askToJoinSelector, { timeout: 30000 }).then(el => ({ el, type: 'ask_to_join' as const })),
+        ...askToJoinSelectors.map(sel =>
+          page.waitForSelector(sel, { timeout: 30000 }).then(el => ({ el, type: 'ask_to_join' as const }))
+        ),
       ]);
 
       if (joinButton.type === 'join_now') {
@@ -185,11 +198,12 @@ export async function joinGoogleMeeting(
         await clickHandle(joinButton.el!, "switch_here");
         log("Bot joined Google Meet as authenticated user (Switch here — same account already in call).");
       } else {
-        // Cookies didn't work — fall back to anonymous join
-        log("WARNING: Authenticated mode but 'Ask to join' found instead of 'Join now'. Cookies may not be loaded.");
-        log("Falling back to anonymous-style join...");
+        // "Ask to join" — notetaker must knock for this meeting; the host admits.
+        // The signed-in identity is intact; this is expected for external meets.
+        log("Authenticated mode: meeting requires knocking ('Ask to join'). Knocking as the signed-in notetaker; host must admit.");
 
-        // Fill name since we're in anonymous territory
+        // A signed-in lobby normally has no name field; only fill if one is
+        // present (some lobbies still show it). Harmless no-op otherwise.
         try {
           const nameFieldSelector = googleNameInputSelectors[0];
           const nameField = await page.$(nameFieldSelector);
@@ -202,7 +216,7 @@ export async function joinGoogleMeeting(
         }
 
         await clickHandle(joinButton.el!, "ask_to_join");
-        log(`Bot joined Google Meet via fallback (Ask to join).`);
+        log(`Bot knocked (Ask to join) as the signed-in notetaker; waiting for host admission.`);
       }
     } catch (e) {
       // No button found — take diagnostic screenshot and fail

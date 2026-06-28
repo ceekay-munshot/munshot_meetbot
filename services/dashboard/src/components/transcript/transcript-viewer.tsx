@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
-import { Search, Download, FileText, FileJson, FileVideo, X, Users, MessageSquare, Wifi, WifiOff, Loader2, AlertCircle, Sparkles, Settings, ChevronDown, Mic } from "lucide-react";
+import { Search, Download, FileText, FileJson, FileVideo, X, Users, MessageSquare, Wifi, WifiOff, AlertCircle, Sparkles, Settings, ChevronDown } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -30,9 +30,6 @@ import {
   generateFilename,
 } from "@/lib/export";
 import { cn, parseUTCTimestamp } from "@/lib/utils";
-import { vexaAPI } from "@/lib/api";
-import { toast } from "sonner";
-import { LanguagePicker } from "@/components/language-picker";
 import { type SegmentGroup, deduplicateByIdentity, sortByStartTime } from "@vexaai/transcript-rendering";
 import { format } from "date-fns";
 
@@ -95,7 +92,6 @@ interface TranscriptViewerProps {
   playbackAbsoluteTime?: string | null;
   isPlaybackActive?: boolean;
   onSegmentClick?: (startTimeSeconds: number, absoluteStartTime?: string) => void;
-  onTranscribeComplete?: () => void;
 }
 
 export function TranscriptViewer({
@@ -114,12 +110,9 @@ export function TranscriptViewer({
   playbackAbsoluteTime,
   isPlaybackActive,
   onSegmentClick,
-  onTranscribeComplete,
 }: TranscriptViewerProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedSpeakers, setSelectedSpeakers] = useState<string[]>([]);
-  const [transcribeLanguage, setTranscribeLanguage] = useState("auto");
-  const [isTranscribing, setIsTranscribing] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -306,27 +299,6 @@ export function TranscriptViewer({
     setSearchQuery("");
     setSelectedSpeakers([]);
   }, []);
-
-  const handleTranscribe = useCallback(async () => {
-    if (!meeting?.id) return;
-    setIsTranscribing(true);
-    try {
-      const result = await vexaAPI.transcribeMeeting(
-        meeting.id,
-        transcribeLanguage === "auto" ? undefined : transcribeLanguage
-      );
-      toast.success(`Transcription complete`, {
-        description: `${result.segment_count} segments transcribed`,
-      });
-      onTranscribeComplete?.();
-    } catch (error) {
-      toast.error("Transcription failed", {
-        description: (error as Error).message,
-      });
-    } finally {
-      setIsTranscribing(false);
-    }
-  }, [meeting?.id, transcribeLanguage, onTranscribeComplete]);
 
   const hasActiveFilters = searchQuery.trim() || selectedSpeakers.length > 0;
 
@@ -803,32 +775,7 @@ export function TranscriptViewer({
         >
           {timelineItems.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 text-center animate-fade-in">
-              {meeting.data?.transcribe_enabled === false && !isLive && !hasActiveFilters ? (
-                <>
-                  <div className="w-16 h-16 rounded-full bg-muted/50 flex items-center justify-center mb-4">
-                    <Mic className="h-8 w-8 text-muted-foreground/50" />
-                  </div>
-                  <h3 className="font-medium mb-1">Recording available</h3>
-                  <p className="text-sm text-muted-foreground mb-6">
-                    This meeting was recorded without real-time transcription.
-                  </p>
-                  {isTranscribing ? (
-                    <div className="flex items-center gap-2 text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      <span className="text-sm">Transcribing recording...</span>
-                    </div>
-                  ) : (
-                    <div className="flex flex-col items-center gap-3">
-                      <div className="w-48">
-                        <LanguagePicker value={transcribeLanguage} onValueChange={setTranscribeLanguage} />
-                      </div>
-                      <Button onClick={handleTranscribe}>
-                        Transcribe Recording
-                      </Button>
-                    </div>
-                  )}
-                </>
-              ) : hasActiveFilters ? (
+              {hasActiveFilters ? (
                 <>
                   <div className="w-16 h-16 rounded-full bg-muted/50 flex items-center justify-center mb-4">
                     <Search className="h-8 w-8 text-muted-foreground/50" />
@@ -840,17 +787,6 @@ export function TranscriptViewer({
                   <Button variant="outline" size="sm" onClick={clearFilters}>
                     Clear all filters
                   </Button>
-                </>
-              ) : isLive && meeting.data?.transcribe_enabled === false ? (
-                <>
-                  <div className="w-16 h-16 rounded-full bg-red-50 dark:bg-red-950/30 flex items-center justify-center mb-4 relative">
-                    <Mic className="h-8 w-8 text-red-500" />
-                    <span className="absolute top-1 right-1 h-3 w-3 rounded-full bg-red-500 animate-pulse" />
-                  </div>
-                  <h3 className="font-medium mb-1">Recording in progress</h3>
-                  <p className="text-sm text-muted-foreground">
-                    Audio is being captured. Transcription will run after the meeting ends.
-                  </p>
                 </>
               ) : (
                 <>

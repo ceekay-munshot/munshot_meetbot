@@ -25,6 +25,7 @@ export type BotConfig = {
   recordingEnabled?: boolean;
   captureModes?: string[];  // e.g., ['audio'], ['audio', 'video'], ['audio', 'screenshots']
   recordingUploadUrl?: string;  // meeting-api internal upload endpoint
+  speakerTimelineUploadUrl?: string;  // meeting-api active-speaker timeline endpoint (batch speaker mapping)
 
   // Per-speaker transcription
   transcriptionServiceUrl?: string;   // HTTP endpoint for transcription-service

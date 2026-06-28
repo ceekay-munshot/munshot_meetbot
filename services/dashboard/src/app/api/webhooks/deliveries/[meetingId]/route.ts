@@ -17,7 +17,15 @@ export async function GET(
   }
   const cookieStore = await cookies();
   const userToken = cookieStore.get(getAuthCookieName())?.value;
-  const apiKey = userToken || process.env.VEXA_API_KEY || "";
+  // Multi-user mode: no shared-key fallback — webhook delivery history is
+  // per-user data, so it must be fetched with the caller's own token.
+  const requireAuth = ["1", "true", "yes"].includes(
+    (process.env.VEXA_REQUIRE_AUTH || "").toLowerCase()
+  );
+  if (requireAuth && !userToken) {
+    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  }
+  const apiKey = userToken || (requireAuth ? "" : process.env.VEXA_API_KEY || "");
   const { meetingId } = await params;
 
   try {

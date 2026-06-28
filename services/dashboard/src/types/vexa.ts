@@ -445,48 +445,6 @@ export const SUPPORTED_LANGUAGES = [
 ] as const;
 
 // ==========================================
-// Recording Types (from meeting.data.recordings)
-// ==========================================
-
-export type RecordingStatus = "in_progress" | "uploading" | "completed" | "failed";
-export type RecordingSource = "bot" | "upload" | "url";
-export type MediaFileType = "audio" | "video" | "screenshot";
-
-export interface RecordingMediaFile {
-  id: number;
-  type: MediaFileType;
-  format: string; // wav, webm, opus, mp3, etc.
-  storage_path: string;
-  storage_backend: "minio" | "s3" | "local";
-  file_size_bytes: number | null;
-  duration_seconds: number | null;
-  finalized_by?: string | null; // "recording_finalizer.master" when master
-  is_final?: boolean;
-  metadata?: Record<string, unknown>;
-  created_at: string;
-}
-
-// v0.10.6.1 - canonical playback routes. Producer writes; consumer reads.
-// Null sub-field means no master for that type yet.
-export interface RecordingPlaybackUrl {
-  audio: string | null; // stable route, e.g. /recordings/<id>/master?type=audio
-  video: string | null;
-}
-
-export interface RecordingData {
-  id: number;
-  meeting_id: number;
-  user_id: number;
-  session_uid: string;
-  source: RecordingSource;
-  status: RecordingStatus;
-  created_at: string;
-  completed_at: string | null;
-  media_files: RecordingMediaFile[]; // deprecated in v0.10.6.1; removed in v0.10.7
-  playback_url?: RecordingPlaybackUrl | null; // v0.10.6.1 canonical
-}
-
-// ==========================================
 // Admin API Types
 // ==========================================
 

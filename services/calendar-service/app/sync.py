@@ -27,6 +27,10 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 MEETING_API_URL = os.getenv("MEETING_API_URL", "http://meeting-api:8080")
 BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")
 DEFAULT_LEAD_TIME_MINUTES = int(os.getenv("DEFAULT_LEAD_TIME_MINUTES", "2"))
+# Display name for auto-dispatched bots (matches the product default).
+CALENDAR_BOT_NAME = os.getenv("DEFAULT_BOT_NAME", "munshot meetbot")
+# This fork is Google-Meet-only; ignore Zoom/Teams links found on calendars.
+GOOGLE_MEET_ONLY = os.getenv("CALENDAR_GOOGLE_MEET_ONLY", "true").lower() in ("1", "true", "yes")
 
 
 async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
@@ -151,22 +155,44 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
     scheduled = 0
 
     for event in events:
-        # Get user's API key for meeting-api auth
+        # Google-Meet-only fork: skip Zoom/Teams links found on calendars.
+        if GOOGLE_MEET_ONLY and event.platform != "google_meet":
+            await db.execute(
+                update(CalendarEvent).where(CalendarEvent.id == event.id).values(status="skipped")
+            )
+            continue
+
         user_result = await db.execute(select(User).where(User.id == event.user_id))
         user = user_result.scalar_one_or_none()
         if not user:
             continue
 
+        # Respect the user's auto-join preference (default on when unset).
+        prefs = ((user.data or {}).get("google_calendar", {}) or {}).get("preferences", {})
+        if prefs.get("auto_join") is False:
+            continue
+
         try:
+            # Own the meeting by the EVENT's user — inject the trusted identity
+            # headers meeting-api reads (same contract the api-gateway uses). Without
+            # this, every auto-joined transcript would land under BOT_API_TOKEN's
+            # single account instead of the calendar owner. See meeting_api/auth.py.
+            headers = {
+                "X-User-ID": str(event.user_id),
+                "X-User-Scopes": "bot",
+                "X-User-Limits": str(getattr(user, "max_concurrent_bots", 1) or 1),
+            }
+            if BOT_API_TOKEN:
+                headers["X-API-Key"] = BOT_API_TOKEN
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     f"{MEETING_API_URL}/bots",
                     json={
                         "platform": event.platform,
                         "native_meeting_id": _extract_native_id(event.meeting_url, event.platform),
-                        "bot_name": f"Vexa - {event.title or 'Calendar'}",
+                        "bot_name": CALENDAR_BOT_NAME,
                     },
-                    headers={"X-API-Key": BOT_API_TOKEN},
+                    headers=headers,
                     timeout=30,
                 )
 

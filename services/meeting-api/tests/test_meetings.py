@@ -51,6 +51,31 @@ def _setup_create_meeting_db(mock_db):
     mock_db.execute = AsyncMock(side_effect=multi_execute)
 
 
+def _setup_global_cap_db(mock_db, user_active=0, global_active=0):
+    """DB mock for the POST /bots flow with the global cap ENABLED.
+
+    With GLOBAL_MAX_CONCURRENT_BOTS > 0 the endpoint runs one extra count query
+    after the per-user count:
+    1. Duplicate check → empty
+    2. Per-user active count → user_active
+    3. Global active count → global_active
+    """
+    call_count = 0
+
+    async def multi_execute(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return MockResult([])
+        elif call_count == 2:
+            return MockResult(scalar_value=user_active)
+        elif call_count == 3:
+            return MockResult(scalar_value=global_active)
+        return MockResult()
+
+    mock_db.execute = AsyncMock(side_effect=multi_execute)
+
+
 # ===================================================================
 # POST /bots — create meeting
 # ===================================================================
@@ -127,6 +152,47 @@ class TestCreateMeeting:
                 })
 
         assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_create_meeting_global_cap_rejects(self, client, mock_db, mock_redis):
+        """POST /bots → 503 when the global concurrent-bot cap is reached.
+
+        The user is under their own per-user limit, but the host is at capacity
+        across all users — protects a fixed-size box (e.g. single EC2, 7 bots).
+        """
+        _setup_global_cap_db(mock_db, user_active=0, global_active=7)
+
+        with patch("meeting_api.meetings.GLOBAL_MAX_CONCURRENT_BOTS", 7):
+            resp = await client.post("/bots", json={
+                "platform": "google_meet",
+                "native_meeting_id": "abc-defg-hij",
+            })
+
+        assert resp.status_code == 503
+        assert "capacity" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_meeting_global_cap_allows_under_limit(self, client, mock_db, mock_redis):
+        """POST /bots → 201 when global active count is below the cap."""
+        _setup_global_cap_db(mock_db, user_active=0, global_active=3)
+
+        runtime_resp = {"container_id": TEST_CONTAINER_ID, "name": TEST_CONTAINER_NAME}
+        with patch("meeting_api.meetings.GLOBAL_MAX_CONCURRENT_BOTS", 7):
+            with patch("meeting_api.meetings._spawn_via_runtime_api", new_callable=AsyncMock, return_value=runtime_resp):
+                with patch("meeting_api.meetings.mint_meeting_token", return_value="fake.jwt.token"):
+                    with patch("meeting_api.meetings.async_session_local") as mock_sf:
+                        inner = AsyncMock()
+                        inner.add = MagicMock()
+                        inner.commit = AsyncMock()
+                        mock_sf.return_value.__aenter__ = AsyncMock(return_value=inner)
+                        mock_sf.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                        resp = await client.post("/bots", json={
+                            "platform": "google_meet",
+                            "native_meeting_id": "abc-defg-hij",
+                        })
+
+        assert resp.status_code == 201
 
     @pytest.mark.asyncio
     async def test_create_meeting_auth_required(self, unauthed_client):

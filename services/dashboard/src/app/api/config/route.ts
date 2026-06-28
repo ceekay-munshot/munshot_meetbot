@@ -54,14 +54,23 @@ export async function GET(request: NextRequest) {
     wsUrl = `${proto}://${host}/ws`;
   }
 
-  // Auth token for WebSocket: cookie first; self-hosted service token only when explicitly configured.
+  // Auth token for WebSocket: cookie first; self-hosted service token only when
+  // explicitly configured. In multi-user mode (VEXA_REQUIRE_AUTH) there is no
+  // shared-key fallback — handing the shared VEXA_API_KEY to an unauthenticated
+  // browser would let it subscribe to the system user's live transcripts over
+  // the WebSocket, breaking per-user isolation. Without a login cookie the
+  // client simply gets a null token and cannot open an authenticated WS.
   const cookieStore = await cookies();
+  const requireAuth = ["1", "true", "yes"].includes(
+    (process.env.VEXA_REQUIRE_AUTH || "").toLowerCase()
+  );
+  const wsFallbackToken = requireAuth ? null : (process.env.VEXA_API_KEY || null);
   const authToken = cookieStore.get(getAuthCookieName())?.value
-    || process.env.VEXA_API_KEY
+    || wsFallbackToken
     || null;
 
   // Get default bot name from environment (optional); fall back to product default
-  const defaultBotName = process.env.DEFAULT_BOT_NAME || "Munshot Notetaker";
+  const defaultBotName = process.env.DEFAULT_BOT_NAME || "munshot meetbot";
 
   // Hosted mode flags (read at runtime, not build time)
   const hostedMode = process.env.NEXT_PUBLIC_HOSTED_MODE === "true";

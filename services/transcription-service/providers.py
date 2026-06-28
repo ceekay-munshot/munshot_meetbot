@@ -28,6 +28,57 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+# Providers report the spoken language inconsistently: Groq's Whisper verbose_json
+# returns the full English name ("English"), while Deepgram returns a BCP-47 tag
+# that may carry a region suffix ("en-US"). Downstream (meeting-api) only accepts
+# bare faster-whisper ISO codes ("en"), so normalize to that here at the boundary.
+_LANG_NAME_TO_CODE = {
+    "english": "en", "chinese": "zh", "mandarin": "zh", "cantonese": "yue",
+    "german": "de", "spanish": "es", "russian": "ru", "korean": "ko",
+    "french": "fr", "japanese": "ja", "portuguese": "pt", "turkish": "tr",
+    "polish": "pl", "catalan": "ca", "dutch": "nl", "arabic": "ar",
+    "swedish": "sv", "italian": "it", "indonesian": "id", "hindi": "hi",
+    "finnish": "fi", "vietnamese": "vi", "hebrew": "he", "ukrainian": "uk",
+    "greek": "el", "malay": "ms", "czech": "cs", "romanian": "ro",
+    "danish": "da", "hungarian": "hu", "tamil": "ta", "norwegian": "no",
+    "nynorsk": "nn", "thai": "th", "urdu": "ur", "croatian": "hr",
+    "bulgarian": "bg", "lithuanian": "lt", "latin": "la", "maori": "mi",
+    "malayalam": "ml", "welsh": "cy", "slovak": "sk", "telugu": "te",
+    "persian": "fa", "latvian": "lv", "bengali": "bn", "serbian": "sr",
+    "azerbaijani": "az", "slovenian": "sl", "kannada": "kn", "estonian": "et",
+    "macedonian": "mk", "breton": "br", "basque": "eu", "icelandic": "is",
+    "armenian": "hy", "nepali": "ne", "mongolian": "mn", "bosnian": "bs",
+    "kazakh": "kk", "albanian": "sq", "swahili": "sw", "galician": "gl",
+    "marathi": "mr", "punjabi": "pa", "sinhala": "si", "khmer": "km",
+    "shona": "sn", "yoruba": "yo", "somali": "so", "afrikaans": "af",
+    "occitan": "oc", "georgian": "ka", "belarusian": "be", "tajik": "tg",
+    "sindhi": "sd", "gujarati": "gu", "amharic": "am", "yiddish": "yi",
+    "lao": "lo", "uzbek": "uz", "faroese": "fo", "haitian creole": "ht",
+    "pashto": "ps", "turkmen": "tk", "maltese": "mt", "sanskrit": "sa",
+    "luxembourgish": "lb", "myanmar": "my", "burmese": "my", "tibetan": "bo",
+    "tagalog": "tl", "malagasy": "mg", "assamese": "as", "tatar": "tt",
+    "hawaiian": "haw", "lingala": "ln", "hausa": "ha", "bashkir": "ba",
+    "javanese": "jw", "sundanese": "su",
+}
+
+
+def _to_iso_language(value: Optional[str]) -> Optional[str]:
+    """Coerce a provider language label to a bare faster-whisper ISO code.
+
+    Handles full English names ("English" -> "en"), region-suffixed BCP-47 tags
+    ("en-US" -> "en"), and passes through values it can't map (e.g. "unknown")
+    unchanged so callers keep whatever fallback they computed.
+    """
+    if not value:
+        return value
+    v = value.strip().lower()
+    if v in _LANG_NAME_TO_CODE:
+        return _LANG_NAME_TO_CODE[v]
+    # Strip region/script subtags: "en-US" / "zh-Hans" -> "en" / "zh".
+    base = v.split("-", 1)[0]
+    return base or value
+
+
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -77,6 +128,17 @@ GROQ_MODEL = _env("GROQ_MODEL", "whisper-large-v3-turbo")
 DEEPGRAM_API_KEY = _env("DEEPGRAM_API_KEY")
 DEEPGRAM_API_URL = _env("DEEPGRAM_API_URL", "https://api.deepgram.com/v1/listen")
 DEEPGRAM_MODEL = _env("DEEPGRAM_MODEL", "nova-3")
+
+# --- Batch (post-meeting, whole-file diarized) -------------------------------
+# The realtime per-chunk path auto-detects language per chunk, which flip-flops
+# on Hindi/English code-switching and shreds transcription quality. The batch
+# path instead sends the WHOLE meeting audio once with Deepgram nova-3's "multi"
+# language (true multilingual code-switching in a single pass) + speaker
+# diarization. Used by meeting-api's post-meeting job, never by realtime.
+DEEPGRAM_BATCH_LANGUAGE = _env("DEEPGRAM_BATCH_LANGUAGE", "multi")
+# Whole-meeting audio can be tens of MB and minutes to process; far longer than
+# the realtime per-chunk timeout.
+DEEPGRAM_BATCH_TIMEOUT_SECONDS = _env_float("DEEPGRAM_BATCH_TIMEOUT_SECONDS", 600.0)
 
 # --- Shared ------------------------------------------------------------------
 PROVIDER_TIMEOUT_SECONDS = _env_float("PROVIDER_TIMEOUT_SECONDS", 30.0)
@@ -148,7 +210,7 @@ def _normalize_groq(data: Dict[str, Any], fallback_language: Optional[str]) -> D
 
     return {
         "text": text.strip(),
-        "language": data.get("language") or fallback_language or "unknown",
+        "language": _to_iso_language(data.get("language")) or fallback_language or "unknown",
         "language_probability": data.get("language_probability", 1.0),
         "duration": float(duration or 0.0),
         "segments": segments,
@@ -167,7 +229,7 @@ def _normalize_deepgram(data: Dict[str, Any], fallback_language: Optional[str]) 
     metadata = data.get("metadata", {}) or {}
     duration = float(metadata.get("duration", 0.0) or 0.0)
 
-    language = channel0.get("detected_language") or fallback_language or "unknown"
+    language = _to_iso_language(channel0.get("detected_language")) or fallback_language or "unknown"
     lang_conf = channel0.get("language_confidence", 1.0)
 
     segments: List[Dict[str, Any]] = []
@@ -218,6 +280,71 @@ def _dg_segment(idx: int, start: float, end: float, text: str) -> Dict[str, Any]
         "no_speech_prob": 0.0,
         "audio_start": start_f,
         "audio_end": end_f,
+    }
+
+
+def _utterance_language(u: Dict[str, Any]) -> Optional[str]:
+    """Best-effort per-utterance language for a Deepgram 'multi' result.
+
+    nova-3 multilingual tags each word with its language; pick the majority
+    word language for the utterance so a Hindi sentence is stored as 'hi' and
+    an English one as 'en' even within the same meeting. Returns None when no
+    per-word language is present (caller falls back to the channel language).
+    """
+    counts: Dict[str, int] = {}
+    for w in u.get("words") or []:
+        lang = w.get("language")
+        if lang:
+            counts[lang] = counts.get(lang, 0) + 1
+    if not counts:
+        return None
+    return _to_iso_language(max(counts, key=counts.get))
+
+
+def _normalize_deepgram_diarized(
+    data: Dict[str, Any], fallback_language: Optional[str]
+) -> Dict[str, Any]:
+    """Like _normalize_deepgram, but preserves the per-utterance speaker index
+    from Deepgram diarization (utterances[].speaker -> int) and the per-utterance
+    language from 'multi'. meeting-api maps speaker_index -> real name afterwards
+    using the bot's active-speaker timeline."""
+    results = data.get("results", {}) or {}
+    channels = results.get("channels", []) or []
+    channel0 = channels[0] if channels else {}
+    alternatives = channel0.get("alternatives", []) or []
+    alt0 = alternatives[0] if alternatives else {}
+
+    metadata = data.get("metadata", {}) or {}
+    duration = float(metadata.get("duration", 0.0) or 0.0)
+
+    channel_language = _to_iso_language(channel0.get("detected_language")) or fallback_language or "multi"
+    lang_conf = channel0.get("language_confidence", 1.0)
+
+    segments: List[Dict[str, Any]] = []
+    for idx, u in enumerate(results.get("utterances") or []):
+        seg = _dg_segment(
+            idx,
+            start=u.get("start", 0.0),
+            end=u.get("end", 0.0),
+            text=u.get("transcript", "") or "",
+        )
+        spk = u.get("speaker")
+        seg["speaker_index"] = int(spk) if spk is not None else None
+        seg["language"] = _utterance_language(u) or channel_language
+        segments.append(seg)
+
+    text = alt0.get("transcript") or " ".join(s["text"].strip() for s in segments).strip()
+    if not duration and segments:
+        duration = segments[-1]["end"]
+
+    return {
+        "text": text.strip(),
+        "language": channel_language,
+        "language_probability": float(lang_conf or 1.0),
+        "duration": duration,
+        "segments": segments,
+        "provider": "deepgram",
+        "diarized": True,
     }
 
 
@@ -284,6 +411,69 @@ async def _transcribe_via_deepgram(
     )
     resp.raise_for_status()
     return _normalize_deepgram(resp.json(), language)
+
+
+async def _transcribe_via_deepgram_batch(
+    client: httpx.AsyncClient,
+    audio_bytes: bytes,
+    content_type: str,
+    language: str,
+    diarize: bool,
+) -> Dict[str, Any]:
+    """Whole-file Deepgram call for the post-meeting batch path: one request,
+    multilingual ('multi') by default, with speaker diarization."""
+    params: Dict[str, str] = {
+        "model": DEEPGRAM_MODEL,
+        "smart_format": "true",
+        "punctuate": "true",
+        "utterances": "true",
+        # Pin language (default 'multi') — never detect_language here; that is
+        # exactly the per-chunk auto-detect that wrecked realtime quality.
+        "language": language,
+    }
+    if diarize:
+        params["diarize"] = "true"
+
+    resp = await client.post(
+        DEEPGRAM_API_URL,
+        params=params,
+        headers={
+            "Authorization": f"Token {DEEPGRAM_API_KEY}",
+            "Content-Type": content_type or "audio/webm",
+        },
+        content=audio_bytes,
+    )
+    resp.raise_for_status()
+    return _normalize_deepgram_diarized(resp.json(), language)
+
+
+async def transcribe_file_diarized(
+    audio_bytes: bytes,
+    content_type: str = "audio/webm",
+    language: Optional[str] = None,
+    diarize: bool = True,
+) -> Dict[str, Any]:
+    """Public entrypoint for the post-meeting batch transcript.
+
+    Sends the WHOLE meeting audio to Deepgram once with 'multi' language +
+    diarization. Deepgram-only by design (Groq Whisper has no diarization).
+    Raises AllProvidersFailed if Deepgram is unconfigured or fails.
+    """
+    if not DEEPGRAM_API_KEY:
+        raise AllProvidersFailed("deepgram: DEEPGRAM_API_KEY not set (required for batch diarized transcription)")
+
+    lang = (language or DEEPGRAM_BATCH_LANGUAGE).strip() or DEEPGRAM_BATCH_LANGUAGE
+    timeout = httpx.Timeout(DEEPGRAM_BATCH_TIMEOUT_SECONDS, connect=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            return await _with_retries(
+                "deepgram-batch",
+                lambda: _transcribe_via_deepgram_batch(
+                    client, audio_bytes, content_type, lang, diarize
+                ),
+            )
+        except Exception as e:
+            raise AllProvidersFailed(f"deepgram-batch: {_describe_http_error(e)}")
 
 
 async def transcribe_via_providers(

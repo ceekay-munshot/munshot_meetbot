@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { Video, Loader2, Sparkles, Globe, Mic, Monitor, UserCheck } from "lucide-react";
+import { Video, Loader2, Sparkles, Globe, Monitor, UserCheck } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -45,10 +45,9 @@ export function JoinModal() {
   const [platform, setPlatform] = useState<Platform>("google_meet");
   const [language, setLanguage] = useState("auto");
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [transcribeEnabled, setTranscribeEnabled] = useState(true);
   const [botName, setBotName] = useState(() => {
     if (typeof window !== "undefined") {
-      return localStorage.getItem("vexa-join-bot-name") || "Vexa";
+      return localStorage.getItem("vexa-join-bot-name") || "munshot meetbot";
     }
     return "Vexa";
   });
@@ -73,7 +72,6 @@ export function JoinModal() {
       setMeetingInput("");
       setPlatform("google_meet");
       setIsSubmitting(false);
-      setTranscribeEnabled(true);
       setPasscode("");
       setAuthenticated(false);
     }
@@ -147,15 +145,12 @@ export function JoinModal() {
       request.meeting_url = parsedInput.originalUrl;
     }
 
-    request.bot_name = botName.trim() || config?.defaultBotName || "Vexa";
+    request.bot_name = botName.trim() || config?.defaultBotName || "munshot meetbot";
 
     if (language && language !== "auto") {
       request.language = language;
     }
 
-    if (!transcribeEnabled) {
-      request.transcribe_enabled = false;
-    }
 
     if (authenticated) {
       request.authenticated = true;
@@ -215,7 +210,7 @@ export function JoinModal() {
     } finally {
       setIsSubmitting(false);
     }
-  }, [parsedInput, passcode, botName, language, transcribeEnabled, authenticated, config, setActiveMeeting, setCurrentMeeting, closeModal, router, user]);
+  }, [parsedInput, passcode, botName, language, authenticated, config, setActiveMeeting, setCurrentMeeting, closeModal, router, user]);
 
   const handleBrowserSession = useCallback(async () => {
     setIsSubmitting(true);
@@ -487,43 +482,23 @@ export function JoinModal() {
             />
           </div>
 
-          {/* Transcription Toggle */}
-          <div className="flex items-center justify-between">
-            <Label htmlFor="transcribe" className="text-sm flex items-center gap-2 cursor-pointer">
-              <Mic className="h-3.5 w-3.5" />
-              Real-time Transcription
+          {/* Language Selection */}
+          <div className="space-y-2">
+            <Label htmlFor="language" className="text-sm flex items-center gap-2">
+              <Globe className="h-3.5 w-3.5" />
+              Transcription Language
             </Label>
-            <Switch
-              id="transcribe"
-              checked={transcribeEnabled}
-              onCheckedChange={setTranscribeEnabled}
+            <LanguagePicker
+              value={language}
+              onValueChange={setLanguage}
+              triggerClassName="h-10 w-full justify-between"
             />
+            {language === "auto" && (
+              <p className="text-xs text-muted-foreground">
+                Auto-detect: the service will detect the language automatically.
+              </p>
+            )}
           </div>
-          {!transcribeEnabled && (
-            <p className="text-xs text-muted-foreground -mt-2">
-              Bot will record audio only. You can transcribe later from the meeting page.
-            </p>
-          )}
-
-          {/* Language Selection - multi-select, only shown when transcription is enabled */}
-          {transcribeEnabled && (
-            <div className="space-y-2">
-              <Label htmlFor="language" className="text-sm flex items-center gap-2">
-                <Globe className="h-3.5 w-3.5" />
-                Transcription Language
-              </Label>
-              <LanguagePicker
-                value={language}
-                onValueChange={setLanguage}
-                triggerClassName="h-10 w-full justify-between"
-              />
-              {language === "auto" && (
-                <p className="text-xs text-muted-foreground">
-                  Auto-detect: the service will detect the language automatically.
-                </p>
-              )}
-            </div>
-          )}
 
           {/* Authenticated Toggle — coming soon */}
           <div className="flex items-center justify-between opacity-50">
@@ -573,7 +548,7 @@ export function JoinModal() {
               ) : (
                 <>
                   <Sparkles className="mr-2 h-5 w-5" />
-                  {transcribeEnabled ? "Start Transcription" : "Start Recording"}
+                  Start Transcription
                 </>
               )}
             </Button>

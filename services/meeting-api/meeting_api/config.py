@@ -32,6 +32,15 @@ try:
 except ValueError:
     BOT_STOP_DELAY_SECONDS = 90
 
+# Global concurrency cap across ALL users — protects a fixed-capacity host
+# (e.g. a single EC2 box sized for N bots) from being oversubscribed when many
+# users each sit under their own per-user max_concurrent_bots limit. Counts
+# active meeting bots across every user; 0 = disabled (no global cap, default).
+try:
+    GLOBAL_MAX_CONCURRENT_BOTS = max(0, int(os.getenv("GLOBAL_MAX_CONCURRENT_BOTS", "0")))
+except ValueError:
+    GLOBAL_MAX_CONCURRENT_BOTS = 0
+
 # Transcription collector
 TRANSCRIPTION_COLLECTOR_URL = os.getenv(
     "TRANSCRIPTION_COLLECTOR_URL",
@@ -44,7 +53,3 @@ POST_MEETING_HOOKS = [
     for url in os.getenv("POST_MEETING_HOOKS", "").split(",")
     if url.strip()
 ]
-
-# Recording metadata mode
-def get_recording_metadata_mode() -> str:
-    return os.getenv("RECORDING_METADATA_MODE", "meeting_data").strip().lower()

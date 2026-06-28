@@ -1,7 +1,10 @@
 """Google Calendar API client — auth, event listing, meeting URL extraction."""
 
 import re
+import json
+import base64
 import logging
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -10,7 +13,62 @@ import httpx
 logger = logging.getLogger("calendar-service.google")
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+
+# openid+email so we can identify the connecting account from the id_token
+# (never trust a client-supplied email); calendar.readonly for sync.
+OAUTH_SCOPES = "openid email https://www.googleapis.com/auth/calendar.readonly"
+
+
+def build_consent_url(client_id: str, redirect_uri: str, state: str) -> str:
+    """Build the Google OAuth consent URL (offline access, forced consent)."""
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": OAUTH_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+
+async def exchange_code_for_tokens(
+    client_id: str, client_secret: str, code: str, redirect_uri: str
+) -> dict:
+    """Exchange an authorization code for tokens (refresh_token + id_token)."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def email_from_id_token(id_token: str) -> Optional[str]:
+    """Extract the verified email from a Google id_token JWT payload.
+
+    No signature verification needed: the token came directly from Google's
+    token endpoint over TLS, so its contents are trusted.
+    """
+    try:
+        payload_b64 = id_token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("email")
+    except Exception as e:
+        logger.warning(f"Could not decode id_token email: {e}")
+        return None
 
 
 async def refresh_access_token(

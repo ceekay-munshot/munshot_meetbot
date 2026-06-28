@@ -6,7 +6,7 @@ from typing import Optional, Dict, Set
 
 import redis # For redis.exceptions
 import redis.asyncio as aioredis
-from sqlalchemy import text as sql_text
+from sqlalchemy import select, text as sql_text
 
 from ..database import async_session_local
 from ..models import Transcription, Meeting
@@ -14,6 +14,27 @@ from .config import BACKGROUND_TASK_INTERVAL, IMMUTABILITY_THRESHOLD
 from .d1_forwarder import forward_segments_to_d1
 
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_owner_emails(db, meeting_ids: Set[int]) -> Dict[int, str]:
+    """Map each meeting_id -> its owning user's email, for the D1 mirror.
+
+    Best-effort: any DB/import error just yields an empty map (rows mirror with a
+    NULL owner_email rather than failing the transcript write).
+    """
+    if not meeting_ids:
+        return {}
+    try:
+        from admin_models.models import User
+        rows = (await db.execute(
+            select(Meeting.id, User.email)
+            .join(User, User.id == Meeting.user_id)
+            .where(Meeting.id.in_(meeting_ids))
+        )).all()
+        return {mid: email for mid, email in rows if email}
+    except Exception as e:
+        logger.error(f"Could not resolve owner emails for D1 mirror (non-fatal): {e}")
+        return {}
 
 def create_transcription_object(meeting_id: int, start: float, end: float, text: str, language: Optional[str], session_uid: Optional[str], mapped_speaker_name: Optional[str], segment_id: Optional[str] = None) -> Transcription:
     """Creates a Transcription ORM object without adding/committing."""
@@ -126,8 +147,13 @@ async def process_redis_to_postgres(redis_c: aioredis.Redis, local_transcription
 
                         # Mirror finalized segments to Cloudflare D1 (best-effort,
                         # never blocks local writes — Postgres stays authoritative).
+                        # Resolve owner emails so D1 rows carry ownership for the
+                        # Cloudflare frontend to filter per-client.
                         try:
-                            await forward_segments_to_d1(batch_to_store)
+                            owner_emails = await _resolve_owner_emails(
+                                db, {t.meeting_id for t in batch_to_store}
+                            )
+                            await forward_segments_to_d1(batch_to_store, owner_emails)
                         except Exception as e:
                             logger.error(f"D1 forward failed (non-fatal): {e}", exc_info=True)
 

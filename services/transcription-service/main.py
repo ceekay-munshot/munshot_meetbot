@@ -603,6 +603,59 @@ async def transcribe_audio(
             transcription_semaphore.release()
 
 
+@app.post("/v1/transcribe/batch")
+async def transcribe_batch(
+    request: Request,
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    diarize: str = Form("true"),
+    _: bool = Depends(verify_api_token),
+):
+    """Whole-file, diarized, multilingual transcription for the post-meeting
+    batch path (meeting-api calls this once after a meeting ends).
+
+    Unlike /v1/audio/transcriptions (realtime, per-chunk, language auto-detected
+    per chunk), this sends the ENTIRE meeting audio to Deepgram in a single
+    request with 'multi' language (Hindi+English code-switching handled in one
+    pass) and speaker diarization. Each returned segment carries `speaker_index`
+    (Deepgram diarization id) and a per-utterance `language`; meeting-api maps
+    speaker_index -> participant name using the bot's active-speaker timeline.
+
+    Deepgram-only by design (Groq has no diarization); requires cloud mode.
+    """
+    if not CLOUD_MODE:
+        raise HTTPException(
+            status_code=400,
+            detail="Batch diarized transcription requires cloud provider mode (TRANSCRIPTION_PROVIDER=deepgram/cloud).",
+        )
+
+    audio_bytes = await file.read()
+    do_diarize = str(diarize).strip().lower() in {"1", "true", "yes", "on"}
+    logger.info(
+        f"Worker {WORKER_ID} batch transcribe: {len(audio_bytes)} bytes, "
+        f"filename={file.filename}, content_type={file.content_type}, "
+        f"language={language or providers.DEEPGRAM_BATCH_LANGUAGE}, diarize={do_diarize}"
+    )
+
+    start = time.time()
+    try:
+        result = await providers.transcribe_file_diarized(
+            audio_bytes=audio_bytes,
+            content_type=file.content_type or "audio/webm",
+            language=language,
+            diarize=do_diarize,
+        )
+    except providers.AllProvidersFailed as e:
+        logger.error(f"Worker {WORKER_ID} batch transcription failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Batch transcription failed: {e}")
+
+    logger.info(
+        f"Worker {WORKER_ID} batch transcribe done in {time.time() - start:.1f}s — "
+        f"segments={len(result.get('segments', []))}, language={result.get('language')}"
+    )
+    return result
+
+
 @app.get("/")
 async def root():
     """Root endpoint with service info"""

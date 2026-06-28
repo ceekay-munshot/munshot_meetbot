@@ -316,11 +316,21 @@ async def create_user(user_in: UserCreate, response: Response, db: AsyncSession 
         return UserResponse.model_validate(existing_user)
 
     user_data = user_in.model_dump()
+    # New-user concurrency default. Callers (OAuth/magic-link signup) omit
+    # max_concurrent_bots, so without this a new user is created with NULL/0 —
+    # and the meeting-api enforcement treats 0 as UNLIMITED, letting any fresh
+    # user exhaust a fixed-capacity host. Default to DEFAULT_MAX_CONCURRENT_BOTS
+    # (2) so every user gets a real per-user cap; operators can raise/lower it,
+    # or set 0 to restore the legacy unlimited behaviour.
+    default_max_concurrent = int(os.getenv("DEFAULT_MAX_CONCURRENT_BOTS", "2"))
+    requested_max_concurrent = user_data.get('max_concurrent_bots')
+    if requested_max_concurrent is None:
+        requested_max_concurrent = default_max_concurrent
     db_user = User(
         email=user_data['email'],
         name=user_data.get('name'),
         image_url=user_data.get('image_url'),
-        max_concurrent_bots=user_data.get('max_concurrent_bots', 0)
+        max_concurrent_bots=requested_max_concurrent
     )
     db.add(db_user)
     await db.commit()

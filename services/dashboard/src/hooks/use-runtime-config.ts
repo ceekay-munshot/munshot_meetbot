@@ -95,7 +95,7 @@ export function getDefaultBotName(): string {
     return cachedConfig.defaultBotName;
   }
   // Fallback to default
-  return "Munshot Notetaker";
+  return "munshot meetbot";
 }
 
 /**

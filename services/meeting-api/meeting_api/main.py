@@ -59,7 +59,7 @@ _VEXA_ENV = os.getenv("VEXA_ENV", "development")
 _PUBLIC_DOCS = _VEXA_ENV != "production"
 app = FastAPI(
     title="Meeting API",
-    description="Meeting bot management — join/stop bots, voice agent, recordings, webhooks, transcription collection",
+    description="Meeting bot management — join/stop bots, voice agent, webhooks, transcription collection",
     version="0.1.0",
     docs_url="/docs" if _PUBLIC_DOCS else None,
     redoc_url="/redoc" if _PUBLIC_DOCS else None,
@@ -82,8 +82,8 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.include_router(meetings_router)
 app.include_router(callbacks_router)
 app.include_router(voice_agent_router)
-app.include_router(recordings_router)
 app.include_router(collector_router)
+app.include_router(recordings_router)
 
 # Collector background task references
 _collector_tasks: list = []

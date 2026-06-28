@@ -11,8 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
 from ..database import get_db, async_session_local
-from ..models import Meeting, Transcription, MeetingSession, Recording
-from ..storage import create_storage_client
+from ..models import Meeting, Transcription, MeetingSession
 from ..schemas import (
     MeetingResponse,
     MeetingListResponse,
@@ -31,101 +30,6 @@ from .auth import get_current_user, require_internal_secret
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-
-def _extract_storage_targets_from_meeting_data(data: Optional[Dict]) -> List[Tuple[str, str]]:
-    """Collect (storage_backend, storage_path) from meeting.data['recordings'] payload."""
-    targets: List[Tuple[str, str]] = []
-    if not isinstance(data, dict):
-        return targets
-
-    for rec in (data.get("recordings") or []):
-        if not isinstance(rec, dict):
-            continue
-        for mf in (rec.get("media_files") or []):
-            if not isinstance(mf, dict):
-                continue
-            path = mf.get("storage_path")
-            if not isinstance(path, str) or not path:
-                continue
-            backend = mf.get("storage_backend")
-            if not isinstance(backend, str) or not backend:
-                backend = os.getenv("STORAGE_BACKEND", "minio")
-            targets.append((str(backend).strip().lower(), path))
-
-    return targets
-
-
-async def _purge_recordings_for_meeting(
-    db: AsyncSession,
-    meeting: Meeting,
-    user_id: int,
-) -> Dict[str, int]:
-    """
-    Delete recording DB rows and storage objects for a meeting.
-    Handles both meeting.data metadata mode and normalized Recording model mode.
-    """
-    # backend -> set(paths)
-    targets_by_backend: Dict[str, set[str]] = {}
-    for backend, path in _extract_storage_targets_from_meeting_data(meeting.data):
-        targets_by_backend.setdefault(backend, set()).add(path)
-
-    # Collect normalized recording rows/media paths and mark rows for deletion.
-    table_exists_result = await db.execute(text("SELECT to_regclass('public.recordings') IS NOT NULL"))
-    recordings_table_exists = bool(table_exists_result.scalar())
-    if recordings_table_exists:
-        stmt_recordings = select(Recording).where(
-            Recording.meeting_id == meeting.id,
-            Recording.user_id == user_id,
-        )
-        result_recordings = await db.execute(stmt_recordings)
-        recordings = result_recordings.scalars().all()
-    else:
-        logger.info("[API] recordings table unavailable in this environment; skipping model recording cleanup")
-        recordings = []
-    model_recordings_deleted = 0
-
-    for recording in recordings:
-        await db.refresh(recording, ["media_files"])
-        for media_file in (recording.media_files or []):
-            if media_file.storage_path:
-                backend = (media_file.storage_backend or os.getenv("STORAGE_BACKEND", "minio")).strip().lower()
-                targets_by_backend.setdefault(backend, set()).add(media_file.storage_path)
-        await db.delete(recording)
-        model_recordings_deleted += 1
-
-    storage_files_deleted = 0
-    storage_files_targeted = sum(len(v) for v in targets_by_backend.values())
-    if storage_files_targeted:
-        clients: Dict[str, object] = {}
-
-        for backend in list(targets_by_backend.keys()):
-            if backend not in ("minio", "s3", "local"):
-                logger.warning(f"[API] Unknown storage backend '{backend}', defaulting to 'minio'")
-                targets_by_backend.setdefault("minio", set()).update(targets_by_backend.pop(backend))
-
-        for backend in targets_by_backend.keys():
-            try:
-                clients[backend] = create_storage_client(backend)
-            except Exception as e:
-                logger.warning(f"[API] Failed to initialize storage client for backend '{backend}': {e}")
-
-        for backend, paths in targets_by_backend.items():
-            client = clients.get(backend)
-            if client is None:
-                continue
-            for path in paths:
-                try:
-                    client.delete_file(path)
-                    storage_files_deleted += 1
-                except Exception as e:
-                    logger.warning(f"[API] Failed deleting recording media from storage ({backend}:{path}): {e}")
-
-    return {
-        "model_recordings_deleted": model_recordings_deleted,
-        "storage_files_deleted": storage_files_deleted,
-        "storage_files_targeted": storage_files_targeted,
-    }
 
 
 class WsMeetingRef(BaseModel):
@@ -344,7 +248,6 @@ async def get_transcript_by_native_id(
 
     meeting_details = MeetingResponse.model_validate(meeting)
     response_data = meeting_details.model_dump()
-    response_data["recordings"] = (meeting.data or {}).get("recordings", []) if isinstance(meeting.data, dict) else []
     response_data["notes"] = (meeting.data or {}).get("notes") if isinstance(meeting.data, dict) else None
     response_data["data"] = dict(meeting.data) if isinstance(meeting.data, dict) else {}
     response_data["speaker_events"] = (meeting.data or {}).get("speaker_events", []) if isinstance(meeting.data, dict) else []
@@ -550,7 +453,7 @@ async def delete_meeting(
             detail=f"Meeting not finalized; cannot delete transcripts. Current status: {meeting.status}"
         )
 
-    logger.info(f"[API] User {current_user.id} purging transcripts/recordings and anonymizing meeting {internal_meeting_id}")
+    logger.info(f"[API] User {current_user.id} purging transcripts and anonymizing meeting {internal_meeting_id}")
 
     # Delete transcripts from PostgreSQL
     stmt_transcripts = select(Transcription).where(Transcription.meeting_id == internal_meeting_id)
@@ -573,9 +476,6 @@ async def delete_meeting(
         except Exception as e:
             logger.error(f"[API] Failed to delete Redis data for meeting {internal_meeting_id}: {e}")
 
-    # Delete recordings artifacts (DB rows + storage files)
-    recording_cleanup = await _purge_recordings_for_meeting(db, meeting, current_user.id)
-
     # Scrub PII from meeting record while preserving telemetry
     telemetry_fields = {'status_transition', 'completion_reason', 'error', 'diagnostics'}
     scrubbed_data = {k: v for k, v in original_data.items() if k in telemetry_fields}
@@ -591,15 +491,13 @@ async def delete_meeting(
 
     logger.info(
         f"[API] Successfully purged meeting {internal_meeting_id}: "
-        f"{len(transcripts)} transcripts, "
-        f"{recording_cleanup['model_recordings_deleted']} recording rows, "
-        f"{recording_cleanup['storage_files_deleted']}/{recording_cleanup['storage_files_targeted']} recording files; "
+        f"{len(transcripts)} transcripts; "
         f"meeting anonymized"
     )
 
     return {
         "message": (
-            f"Meeting {platform.value}/{native_meeting_id} transcripts and recording artifacts deleted; "
+            f"Meeting {platform.value}/{native_meeting_id} transcripts deleted; "
             "meeting data anonymized"
         )
     }

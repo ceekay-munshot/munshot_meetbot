@@ -36,6 +36,10 @@ services:
           - transcription-service
 
 networks:
+  # Attach to the main stack's network. docker-compose.yml uses project
+  # name `vexa` with an internal network `vexa`, which Docker names
+  # `vexa_vexa` — so the bot/meeting-api (on vexa_vexa) can resolve the
+  # `transcription-service` alias.
   vexa-network:
     external: true
-    name: vexa-network
+    name: vexa_vexa

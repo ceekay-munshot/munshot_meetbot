@@ -156,7 +156,7 @@ async function queryBrowserState(
       const speaking = data.speaking.filter(n => !isJunk(n));
 
       return { filteredNames, speaking };
-    }, botName || 'Vexa Bot');
+    }, botName || 'munshot meetbot');
   } catch (err: any) {
     log(`[SpeakerIdentity] Browser query failed: ${err.message}`);
     return null;
@@ -454,7 +454,7 @@ async function queryZoomActiveSpeaker(page: Page, botName?: string): Promise<str
       }
 
       return null;
-    }, botName || 'Vexa');
+    }, botName || 'munshot meetbot');
   } catch {
     return null;
   }

@@ -6,6 +6,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.security import APIKeyHeader
 import httpx
 import os
+import hmac
 from dotenv import load_dotenv
 import json # For request body processing and token cacheing
 from pydantic import BaseModel, Field
@@ -29,6 +30,7 @@ from meeting_api.schemas import (
     Platform,
     BotStatusResponse,
     SpeakRequest, ChatSendRequest, ChatMessagesResponse, ScreenContentRequest,
+    parse_meeting_url,
 )
 
 load_dotenv()
@@ -37,10 +39,19 @@ load_dotenv()
 ADMIN_API_URL = os.getenv("ADMIN_API_URL")
 MEETING_API_URL = os.getenv("MEETING_API_URL")
 TRANSCRIPTION_COLLECTOR_URL = os.getenv("TRANSCRIPTION_COLLECTOR_URL")
-MCP_URL = os.getenv("MCP_URL")
-CALENDAR_SERVICE_URL = os.getenv("CALENDAR_SERVICE_URL")  # Optional — calendar-service
-AGENT_API_URL = os.getenv("AGENT_API_URL")  # Optional — agent-api for chat
 RUNTIME_API_URL = os.getenv("RUNTIME_API_URL", "http://runtime-api:8090")
+CALENDAR_SERVICE_URL = os.getenv("CALENDAR_SERVICE_URL", "http://calendar-service:8050")
+
+# System API key used by the unauthenticated /public/google-meet endpoint. It is a
+# pre-provisioned token (created by `make setup-api-key`) that owns meetings launched
+# without a caller-supplied key. If unset, the public endpoint returns 503.
+PUBLIC_BOT_API_KEY = os.getenv("PUBLIC_BOT_API_KEY", "")
+DEFAULT_BOT_NAME = os.getenv("DEFAULT_BOT_NAME", "munshot meetbot")
+
+# Admin token — lets the server-to-server /public/join endpoint find-or-create a
+# per-client user by email (so a Cloudflare BFF can launch a bot owning the
+# client's transcript with a single call). Unset → /public/join returns 503.
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "")
 
 # Public share-link settings (for "ChatGPT read from URL" flows)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # Optional override, e.g. https://api.vexa.ai
@@ -65,14 +76,13 @@ ROUTE_SCOPES = {
 }
 
 # --- Validation at startup ---
-if not all([ADMIN_API_URL, MEETING_API_URL, TRANSCRIPTION_COLLECTOR_URL, MCP_URL]):
+if not all([ADMIN_API_URL, MEETING_API_URL, TRANSCRIPTION_COLLECTOR_URL]):
     missing_vars = [
         var_name
         for var_name, var_value in {
             "ADMIN_API_URL": ADMIN_API_URL,
             "MEETING_API_URL": MEETING_API_URL,
             "TRANSCRIPTION_COLLECTOR_URL": TRANSCRIPTION_COLLECTOR_URL,
-            "MCP_URL": MCP_URL,
         }.items()
         if not var_value
     ]
@@ -421,6 +431,41 @@ async def root():
     """Provides a welcome message for the Vexa API Gateway."""
     return {"message": "Welcome to the Vexa API Gateway"}
 
+
+# --- Calendar OAuth Routes (public, proxied to calendar-service) ---
+# Only the three productized endpoints are exposed; management endpoints
+# (/calendar/status, /events, /preferences, ...) stay internal. The OAuth
+# start/callback are public by design; /calendar/oauth is system-key-protected
+# by calendar-service itself.
+@app.get("/calendar/connect/start", tags=["Calendar"], summary="Begin Google Calendar OAuth")
+async def calendar_connect_start_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/connect/start"
+    return await forward_request(app.state.http_client, "GET", url, request, require_auth=False)
+
+
+@app.get("/calendar/connect/callback", tags=["Calendar"], summary="Google Calendar OAuth callback")
+async def calendar_connect_callback_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/connect/callback"
+    return await forward_request(app.state.http_client, "GET", url, request, require_auth=False)
+
+
+@app.post("/calendar/oauth", tags=["Calendar"], summary="Store a calendar refresh token (server-to-server)")
+async def calendar_oauth_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/oauth"
+    return await forward_request(app.state.http_client, "POST", url, request, require_auth=False)
+
+
+@app.post("/calendar/sync", tags=["Calendar"], summary="Sync a client's calendar by email (server-to-server)")
+async def calendar_sync_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/sync"
+    return await forward_request(app.state.http_client, "POST", url, request, require_auth=False)
+
+
+@app.get("/calendar/meetings", tags=["Calendar"], summary="List a client's meetings (calendar + manual)")
+async def calendar_meetings_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/meetings"
+    return await forward_request(app.state.http_client, "GET", url, request, require_auth=False)
+
 # --- Bot Manager Routes --- 
 @app.post("/bots",
          tags=["Bot Management"],
@@ -442,11 +487,291 @@ async def root():
              },
          })
 # Function signature remains generic for forwarding
-async def request_bot_proxy(request: Request): 
+async def request_bot_proxy(request: Request):
     """Forward request to Bot Manager to start a bot."""
     url = f"{MEETING_API_URL}/bots"
     # forward_request handles reading and passing the body from the original request
     return await forward_request(app.state.http_client, "POST", url, request)
+
+
+class PublicGoogleMeetRequest(BaseModel):
+    url: Optional[str] = Field(
+        None,
+        description="Full Google Meet URL, e.g. https://meet.google.com/abc-defg-hij",
+    )
+    native_meeting_id: Optional[str] = Field(
+        None,
+        description="Bare Google Meet code, e.g. abc-defg-hij (alternative to url)",
+    )
+    bot_name: Optional[str] = Field(None, description="Display name for the bot in the meeting")
+
+
+@app.post(
+    "/public/google-meet",
+    tags=["Public"],
+    summary="Launch a Google Meet bot without authentication",
+    description=(
+        "Open endpoint (no API key required). Accepts either a full Google Meet URL or a bare "
+        "abc-defg-hij code, launches a bot that transcribes the meeting, and stores the "
+        "transcript. The meeting is owned by a pre-provisioned system user."
+    ),
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_google_meet(body: PublicGoogleMeetRequest):
+    """Unauthenticated Google-Meet-only bot launch. Reuses the validated /bots path by
+    injecting a server-side system key + resolved identity headers."""
+    # 1. Resolve the Google Meet code from either the URL or the bare code form.
+    native_id: Optional[str] = None
+    if body.url:
+        try:
+            parsed = parse_meeting_url(body.url)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        if parsed.get("platform") != "google_meet":
+            raise HTTPException(status_code=422, detail="Only Google Meet URLs are supported")
+        native_id = parsed.get("native_meeting_id")
+    elif body.native_meeting_id:
+        code = body.native_meeting_id.strip().lower()
+        if not (re.fullmatch(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", code) or
+                re.fullmatch(r"[a-z0-9][a-z0-9-]{3,38}[a-z0-9]", code)):
+            raise HTTPException(status_code=422, detail="Invalid Google Meet code (expected abc-defg-hij)")
+        native_id = code
+    else:
+        raise HTTPException(status_code=422, detail="Provide either 'url' or 'native_meeting_id'")
+
+    if not native_id:
+        raise HTTPException(status_code=422, detail="Could not determine the Google Meet code")
+
+    # 2. Resolve the system key to a real owner identity (same path forward_request uses).
+    if not PUBLIC_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="Public endpoint not configured (PUBLIC_BOT_API_KEY unset)")
+    user_data = await _resolve_token(app.state.http_client, PUBLIC_BOT_API_KEY)
+    if not user_data:
+        raise HTTPException(status_code=503, detail="System API key is invalid or admin-api is unreachable")
+
+    # 3. Build the bot-creation request and forward to meeting-api with injected identity.
+    user_scopes = set(user_data.get("scopes", []))
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": PUBLIC_BOT_API_KEY,
+        "x-user-id": str(user_data["user_id"]),
+        "x-user-scopes": ",".join(user_scopes),
+        "x-user-limits": str(user_data.get("max_concurrent", 1)),
+    }
+    payload = {
+        "platform": "google_meet",
+        "native_meeting_id": native_id,
+        "bot_name": (body.bot_name or "").strip() or DEFAULT_BOT_NAME,
+    }
+    try:
+        resp = await app.state.http_client.request(
+            "POST", f"{MEETING_API_URL}/bots", headers=headers, content=json.dumps(payload),
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+async def _find_or_create_user_by_email(client: httpx.AsyncClient, email: str) -> Optional[dict]:
+    """Find-or-create a Vexa user by email via admin-api. Returns the user dict
+    ({id, email, max_concurrent_bots, ...}) or None if admin-api is unreachable /
+    misconfigured. admin-api's POST /admin/users is idempotent on email."""
+    if not ADMIN_API_TOKEN:
+        return None
+    try:
+        resp = await client.post(
+            f"{ADMIN_API_URL}/admin/users",
+            json={"email": email},
+            headers={"X-Admin-API-Key": ADMIN_API_TOKEN, "content-type": "application/json"},
+            timeout=10.0,
+        )
+    except httpx.RequestError as exc:
+        logger.warning(f"/public/join user resolution failed: {exc}")
+        return None
+    if resp.status_code in (200, 201):
+        return resp.json()
+    logger.warning(f"/public/join user resolution returned {resp.status_code}: {resp.text[:200]}")
+    return None
+
+
+class PublicJoinRequest(BaseModel):
+    email: str = Field(..., description="Client email — owns the meeting/transcript (find-or-create).")
+    meeting_url: Optional[str] = Field(
+        None, description="Full Google Meet URL, e.g. https://meet.google.com/abc-defg-hij"
+    )
+    url: Optional[str] = Field(None, description="Alias for meeting_url.")
+    native_meeting_id: Optional[str] = Field(
+        None, description="Bare Google Meet code, e.g. abc-defg-hij (alternative to a URL)."
+    )
+    bot_name: Optional[str] = Field(None, description="Display name for the bot in the meeting.")
+    language: Optional[str] = Field(None, description="Transcription language hint, e.g. 'en'.")
+    webhook_url: Optional[str] = Field(
+        None, description="Optional per-meeting webhook for status/transcript push back to the caller."
+    )
+
+
+@app.post(
+    "/public/join",
+    tags=["Public"],
+    summary="Launch a Google Meet bot owned by a client email (server-to-server)",
+    description=(
+        "Single-call bot launch for a BFF (e.g. a Cloudflare Worker). Takes a client "
+        "email plus a Google Meet link, find-or-creates the user for that email, and "
+        "launches a bot whose meeting/transcript is OWNED by that user — so each client's "
+        "data stays isolated. Requires the system key in X-API-Key (this is a trusted "
+        "server-to-server endpoint, not for direct browser/client use). NOTE: the email "
+        "controls ownership, not meeting admission — the bot still joins per Google Meet's "
+        "lobby rules unless an authenticated bot identity is configured separately."
+    ),
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_join(body: PublicJoinRequest, x_api_key: Optional[str] = Depends(api_key_scheme)):
+    # 0. Auth: trusted server-to-server only — caller must present the system key.
+    if not PUBLIC_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="Endpoint not configured (PUBLIC_BOT_API_KEY unset)")
+    if not x_api_key or not hmac.compare_digest(x_api_key, PUBLIC_BOT_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing system API key")
+
+    # 1. Validate the client email (owns the resulting meeting/transcript).
+    email = (body.email or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=422, detail="Invalid email")
+
+    # 2. Resolve the Google Meet code from either a URL or the bare code form.
+    native_id: Optional[str] = None
+    meeting_url = body.meeting_url or body.url
+    if meeting_url:
+        try:
+            parsed = parse_meeting_url(meeting_url)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        if parsed.get("platform") != "google_meet":
+            raise HTTPException(status_code=422, detail="Only Google Meet URLs are supported")
+        native_id = parsed.get("native_meeting_id")
+    elif body.native_meeting_id:
+        code = body.native_meeting_id.strip().lower()
+        if not (re.fullmatch(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", code) or
+                re.fullmatch(r"[a-z0-9][a-z0-9-]{3,38}[a-z0-9]", code)):
+            raise HTTPException(status_code=422, detail="Invalid Google Meet code (expected abc-defg-hij)")
+        native_id = code
+    else:
+        raise HTTPException(status_code=422, detail="Provide either 'meeting_url' or 'native_meeting_id'")
+    if not native_id:
+        raise HTTPException(status_code=422, detail="Could not determine the Google Meet code")
+
+    # 3. Find-or-create the user that will OWN this meeting/transcript.
+    user_data = await _find_or_create_user_by_email(app.state.http_client, email)
+    if not user_data or "id" not in user_data:
+        raise HTTPException(status_code=503, detail="Could not resolve client user (admin-api unreachable or ADMIN_API_TOKEN unset)")
+
+    # 4. Forward to meeting-api with injected per-client identity (same trusted
+    #    header path forward_request uses). meeting-api owns the meeting by x-user-id.
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": PUBLIC_BOT_API_KEY,
+        "x-user-id": str(user_data["id"]),
+        "x-user-scopes": "bot",
+        "x-user-limits": str(user_data.get("max_concurrent_bots", 1)),
+    }
+    if body.webhook_url:
+        headers["x-user-webhook-url"] = body.webhook_url
+    payload: dict = {
+        "platform": "google_meet",
+        "native_meeting_id": native_id,
+        "bot_name": (body.bot_name or "").strip() or DEFAULT_BOT_NAME,
+    }
+    if body.language:
+        payload["language"] = body.language
+    try:
+        resp = await app.state.http_client.request(
+            "POST", f"{MEETING_API_URL}/bots", headers=headers, content=json.dumps(payload),
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
+
+class PublicLeaveRequest(BaseModel):
+    email: str = Field(..., description="Client email that owns the meeting (must match the /public/join caller).")
+    meeting_url: Optional[str] = Field(
+        None, description="Full Google Meet URL, e.g. https://meet.google.com/abc-defg-hij"
+    )
+    url: Optional[str] = Field(None, description="Alias for meeting_url.")
+    native_meeting_id: Optional[str] = Field(
+        None, description="Bare Google Meet code, e.g. abc-defg-hij (alternative to a URL)."
+    )
+
+
+@app.post(
+    "/public/leave",
+    tags=["Public"],
+    summary="Stop a Google Meet bot owned by a client email (server-to-server)",
+    description=(
+        "Symmetric counterpart to /public/join: stops the active bot for a client's "
+        "meeting. Identifies the meeting by the client email (owner) plus the Meet link/"
+        "code, and forwards a scoped DELETE so a client can only stop ITS OWN bot. "
+        "Requires the system key in X-API-Key (trusted server-to-server, not browser-facing)."
+    ),
+)
+async def public_leave(body: PublicLeaveRequest, x_api_key: Optional[str] = Depends(api_key_scheme)):
+    # 0. Auth: trusted server-to-server only — caller must present the system key.
+    if not PUBLIC_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="Endpoint not configured (PUBLIC_BOT_API_KEY unset)")
+    if not x_api_key or not hmac.compare_digest(x_api_key, PUBLIC_BOT_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing system API key")
+
+    # 1. Validate the client email (must own the meeting being stopped).
+    email = (body.email or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=422, detail="Invalid email")
+
+    # 2. Resolve the Google Meet code from either a URL or the bare code form.
+    native_id: Optional[str] = None
+    meeting_url = body.meeting_url or body.url
+    if meeting_url:
+        try:
+            parsed = parse_meeting_url(meeting_url)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        if parsed.get("platform") != "google_meet":
+            raise HTTPException(status_code=422, detail="Only Google Meet URLs are supported")
+        native_id = parsed.get("native_meeting_id")
+    elif body.native_meeting_id:
+        code = body.native_meeting_id.strip().lower()
+        if not (re.fullmatch(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", code) or
+                re.fullmatch(r"[a-z0-9][a-z0-9-]{3,38}[a-z0-9]", code)):
+            raise HTTPException(status_code=422, detail="Invalid Google Meet code (expected abc-defg-hij)")
+        native_id = code
+    else:
+        raise HTTPException(status_code=422, detail="Provide either 'meeting_url' or 'native_meeting_id'")
+    if not native_id:
+        raise HTTPException(status_code=422, detail="Could not determine the Google Meet code")
+
+    # 3. Resolve the owning user (find-or-create keeps it symmetric with /public/join;
+    #    a never-seen email simply has no active bot and yields 404 below).
+    user_data = await _find_or_create_user_by_email(app.state.http_client, email)
+    if not user_data or "id" not in user_data:
+        raise HTTPException(status_code=503, detail="Could not resolve client user (admin-api unreachable or ADMIN_API_TOKEN unset)")
+
+    # 4. Forward a scoped DELETE — meeting-api enforces ownership via x-user-id, so a
+    #    client can only stop a bot for a meeting IT owns.
+    headers = {
+        "x-api-key": PUBLIC_BOT_API_KEY,
+        "x-user-id": str(user_data["id"]),
+        "x-user-scopes": "bot",
+        "x-user-limits": str(user_data.get("max_concurrent_bots", 1)),
+    }
+    try:
+        resp = await app.state.http_client.request(
+            "DELETE", f"{MEETING_API_URL}/bots/google_meet/{native_id}", headers=headers,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
 
 @app.delete("/bots/{platform}/{native_meeting_id}",
            tags=["Bot Management"],
@@ -625,60 +950,6 @@ async def avatar_reset_proxy(platform: Platform, native_meeting_id: str, request
     return await forward_request(app.state.http_client, "DELETE", url, request)
 
 # --- END Voice Agent Interaction Routes ---
-
-# --- Calendar Routes (proxy to Calendar Service) ---
-
-@app.post("/calendar/connect",
-          tags=["Calendar"],
-          summary="Trigger initial calendar sync after OAuth",
-          dependencies=[Depends(api_key_scheme)])
-async def calendar_connect_proxy(request: Request):
-    if not CALENDAR_SERVICE_URL:
-        raise HTTPException(status_code=501, detail="Calendar service not configured")
-    url = f"{CALENDAR_SERVICE_URL}/calendar/connect"
-    return await forward_request(app.state.http_client, "POST", url, request)
-
-@app.get("/calendar/status",
-         tags=["Calendar"],
-         summary="Check calendar connection status",
-         dependencies=[Depends(api_key_scheme)])
-async def calendar_status_proxy(request: Request):
-    if not CALENDAR_SERVICE_URL:
-        raise HTTPException(status_code=501, detail="Calendar service not configured")
-    url = f"{CALENDAR_SERVICE_URL}/calendar/status"
-    return await forward_request(app.state.http_client, "GET", url, request)
-
-@app.delete("/calendar/disconnect",
-            tags=["Calendar"],
-            summary="Disconnect calendar integration",
-            dependencies=[Depends(api_key_scheme)])
-async def calendar_disconnect_proxy(request: Request):
-    if not CALENDAR_SERVICE_URL:
-        raise HTTPException(status_code=501, detail="Calendar service not configured")
-    url = f"{CALENDAR_SERVICE_URL}/calendar/disconnect"
-    return await forward_request(app.state.http_client, "DELETE", url, request)
-
-@app.get("/calendar/events",
-         tags=["Calendar"],
-         summary="List upcoming calendar events",
-         dependencies=[Depends(api_key_scheme)])
-async def calendar_events_proxy(request: Request):
-    if not CALENDAR_SERVICE_URL:
-        raise HTTPException(status_code=501, detail="Calendar service not configured")
-    url = f"{CALENDAR_SERVICE_URL}/calendar/events"
-    return await forward_request(app.state.http_client, "GET", url, request)
-
-@app.put("/calendar/preferences",
-         tags=["Calendar"],
-         summary="Update calendar auto-join preferences",
-         dependencies=[Depends(api_key_scheme)])
-async def calendar_preferences_proxy(request: Request):
-    if not CALENDAR_SERVICE_URL:
-        raise HTTPException(status_code=501, detail="Calendar service not configured")
-    url = f"{CALENDAR_SERVICE_URL}/calendar/preferences"
-    return await forward_request(app.state.http_client, "PUT", url, request)
-
-# --- END Calendar Routes ---
 
 # --- Recording Routes (proxy to Bot Manager) ---
 
@@ -1213,274 +1484,6 @@ async def _get_meeting_context(client: httpx.AsyncClient, user_id: str) -> Optio
         logger.warning(f"Meeting context fetch failed for user {user_id}: {e}")
         return None
 
-
-@app.post("/api/chat",
-          tags=["Agent"],
-          summary="Send a message to the AI agent (SSE stream)",
-          description="Forwards chat to agent-api. If session is meeting_aware, injects active meeting context.",
-          dependencies=[Depends(api_key_scheme)])
-async def agent_chat_proxy(request: Request):
-    """Forward chat to agent-api with meeting context injection."""
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-
-    body = await request.body()
-    extra_headers = {}
-
-    # Parse body to check meeting_aware session
-    try:
-        data = json.loads(body)
-        user_id = data.get("user_id", "")
-        session_id = data.get("session_id")
-        if user_id and session_id:
-            redis_client: Optional[aioredis.Redis] = getattr(app.state, "redis", None)
-            if redis_client:
-                meta_raw = await redis_client.hget(f"agent:sessions:{user_id}", session_id)
-                if meta_raw:
-                    meta = json.loads(meta_raw)
-                    if meta.get("meeting_aware"):
-                        # Resolve internal user_id from API key
-                        client_key = request.headers.get("x-api-key")
-                        internal_uid = user_id
-                        if client_key:
-                            user_data = await _resolve_token(app.state.http_client, client_key)
-                            if user_data:
-                                internal_uid = str(user_data["user_id"])
-                        context = await _get_meeting_context(app.state.http_client, internal_uid)
-                        if context:
-                            extra_headers["x-meeting-context"] = context
-                            logger.info(f"Meeting context injected for user {user_id} ({len(context)} bytes)")
-    except Exception as e:
-        logger.warning(f"Meeting context injection error: {e}")
-
-    # Build forwarding headers
-    excluded = {"host", "content-length", "transfer-encoding"}
-    headers = {k.lower(): v for k, v in request.headers.items() if k.lower() not in excluded}
-    for h in ["x-user-id", "x-user-scopes", "x-user-limits",
-              "x-user-webhook-url", "x-user-webhook-secret", "x-user-webhook-events"]:
-        headers.pop(h, None)
-
-    # Auth: inject identity headers
-    client_key = headers.get("x-api-key")
-    if client_key:
-        user_data = await _resolve_token(app.state.http_client, client_key)
-        if user_data:
-            headers["x-user-id"] = str(user_data["user_id"])
-            headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
-            headers["x-user-limits"] = str(user_data.get("max_concurrent", 1))
-
-    headers.update(extra_headers)
-    params = dict(request.query_params)
-
-    # Stream the SSE response from agent-api (long timeout for SSE)
-    url = f"{AGENT_API_URL}/api/chat"
-    try:
-        sse_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0))
-        req = sse_client.build_request(
-            "POST", url, headers=headers, params=params or None, content=body,
-        )
-        resp = await sse_client.send(req, stream=True)
-
-        async def stream_response():
-            try:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-            finally:
-                await resp.aclose()
-
-        resp_headers = {
-            k: v for k, v in resp.headers.items()
-            if k.lower() not in {"content-length", "transfer-encoding", "content-encoding"}
-        }
-        return StreamingResponse(stream_response(), status_code=resp.status_code, headers=resp_headers)
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"Agent API unavailable: {exc}")
-
-
-@app.delete("/api/chat",
-            tags=["Agent"],
-            summary="Interrupt an in-progress chat",
-            dependencies=[Depends(api_key_scheme)])
-async def agent_chat_interrupt_proxy(request: Request):
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-    url = f"{AGENT_API_URL}/api/chat"
-    return await forward_request(app.state.http_client, "DELETE", url, request)
-
-
-@app.post("/api/chat/reset",
-          tags=["Agent"],
-          summary="Reset the chat session",
-          dependencies=[Depends(api_key_scheme)])
-async def agent_chat_reset_proxy(request: Request):
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-    url = f"{AGENT_API_URL}/api/chat/reset"
-    return await forward_request(app.state.http_client, "POST", url, request)
-
-
-@app.get("/api/sessions",
-         tags=["Agent"],
-         summary="List agent sessions for a user",
-         dependencies=[Depends(api_key_scheme)])
-async def agent_sessions_list_proxy(request: Request):
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-    url = f"{AGENT_API_URL}/api/sessions"
-    return await forward_request(app.state.http_client, "GET", url, request)
-
-
-@app.post("/api/sessions",
-          tags=["Agent"],
-          summary="Create a new agent session",
-          dependencies=[Depends(api_key_scheme)])
-async def agent_session_create_proxy(request: Request):
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-    url = f"{AGENT_API_URL}/api/sessions"
-    return await forward_request(app.state.http_client, "POST", url, request)
-
-
-@app.put("/api/sessions/{session_id}",
-         tags=["Agent"],
-         summary="Rename an agent session",
-         dependencies=[Depends(api_key_scheme)])
-async def agent_session_rename_proxy(session_id: str, request: Request):
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-    url = f"{AGENT_API_URL}/api/sessions/{session_id}"
-    return await forward_request(app.state.http_client, "PUT", url, request)
-
-
-@app.delete("/api/sessions/{session_id}",
-            tags=["Agent"],
-            summary="Delete an agent session",
-            dependencies=[Depends(api_key_scheme)])
-async def agent_session_delete_proxy(session_id: str, request: Request):
-    if not AGENT_API_URL:
-        raise HTTPException(503, "Agent API not configured")
-    url = f"{AGENT_API_URL}/api/sessions/{session_id}"
-    return await forward_request(app.state.http_client, "DELETE", url, request)
-
-
-# --- MCP Routes ---
-# Following FastAPI-MCP best practices:
-# - Example 04: Separate server deployment (MCP service runs separately)
-# - Example 08: Auth token passthrough via Authorization header
-# The MCP service handles MCP protocol, gateway just forwards requests
-@app.api_route("/mcp", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-               tags=["MCP"],
-               summary="Forward MCP requests to MCP service",
-               description="Forwards requests to the separate MCP service. MCP protocol endpoint for Model Context Protocol.",
-               dependencies=[Depends(api_key_scheme)])
-async def forward_mcp_root(request: Request):
-    """Forward MCP root endpoint requests to the separate MCP service."""
-    url = f"{MCP_URL}/mcp"
-    
-    # Build headers following MCP transport protocol requirements
-    # MCP expects Authorization header (per Example 08)
-    headers = {}
-    
-    # Auth: Convert X-API-Key to Authorization if needed (MCP expects Authorization)
-    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
-    if auth_header:
-        headers["Authorization"] = auth_header
-    else:
-        x_api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-        if x_api_key:
-            headers["Authorization"] = x_api_key
-    
-    # MCP transport protocol: GET requires text/event-stream, others use application/json
-    if request.method == "GET":
-        headers["Accept"] = "text/event-stream"
-    else:
-        headers["Accept"] = "application/json"
-        if request.method in ["POST", "PUT", "PATCH"]:
-            headers["Content-Type"] = "application/json"
-    
-    # Preserve other headers (excluding hop-by-hop headers)
-    excluded = {"host", "content-length", "transfer-encoding", "accept", "authorization", "x-api-key"}
-    for k, v in request.headers.items():
-        if k.lower() not in excluded:
-            headers[k] = v
-    
-    content = await request.body()
-    
-    try:
-        resp = await app.state.http_client.request(
-            request.method, url, headers=headers,
-            params=dict(request.query_params) or None,
-            content=content
-        )
-        # Some MCP server implementations return a 400 JSON-RPC error for the initial GET handshake
-        # (while still providing a valid `mcp-session-id` header). Many clients treat non-2xx as fatal.
-        status_code = resp.status_code
-        if (
-            request.method == "GET"
-            and resp.status_code == 400
-            and "mcp-session-id" in resp.headers
-            and b"Missing session ID" in (resp.content or b"")
-        ):
-            status_code = 200
-        return Response(content=resp.content, status_code=status_code, headers=dict(resp.headers))
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"MCP service unavailable: {exc}")
-
-
-@app.api_route("/mcp/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-               tags=["MCP"],
-               summary="Forward MCP path requests",
-               description="Forwards MCP requests with paths to the separate MCP service.",
-               dependencies=[Depends(api_key_scheme)])
-async def forward_mcp_path(request: Request, path: str):
-    """Forward MCP path requests to the separate MCP service."""
-    url = f"{MCP_URL}/mcp/{path}"
-    
-    # Same header handling as root endpoint
-    headers = {}
-    
-    # Auth: Convert X-API-Key to Authorization if needed
-    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
-    if auth_header:
-        headers["Authorization"] = auth_header
-    else:
-        x_api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-        if x_api_key:
-            headers["Authorization"] = x_api_key
-    
-    # MCP transport protocol
-    if request.method == "GET":
-        headers["Accept"] = "text/event-stream"
-    else:
-        headers["Accept"] = "application/json"
-        if request.method in ["POST", "PUT", "PATCH"]:
-            headers["Content-Type"] = "application/json"
-    
-    # Preserve other headers
-    excluded = {"host", "content-length", "transfer-encoding", "accept", "authorization", "x-api-key"}
-    for k, v in request.headers.items():
-        if k.lower() not in excluded:
-            headers[k] = v
-    
-    content = await request.body()
-    
-    try:
-        resp = await app.state.http_client.request(
-            request.method, url, headers=headers,
-            params=dict(request.query_params) or None,
-            content=content
-        )
-        status_code = resp.status_code
-        if (
-            request.method == "GET"
-            and resp.status_code == 400
-            and "mcp-session-id" in resp.headers
-            and b"Missing session ID" in (resp.content or b"")
-        ):
-            status_code = 200
-        return Response(content=resp.content, status_code=status_code, headers=dict(resp.headers))
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"MCP service unavailable: {exc}")
 
 # --- Removed internal ID resolution and full transcript fetching from Gateway ---
 

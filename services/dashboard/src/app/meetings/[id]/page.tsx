@@ -36,8 +36,6 @@ import {
   Monitor,
   Save,
 } from "lucide-react";
-import { AudioPlayer, type AudioPlayerHandle, type AudioFragment } from "@/components/recording/audio-player";
-import { VideoPlayer, type VideoPlayerHandle } from "@/components/recording/video-player";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -48,14 +46,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { ErrorState } from "@/components/ui/error-state";
 import { TranscriptViewer } from "@/components/transcript/transcript-viewer";
 import { BotStatusIndicator, BotFailedIndicator } from "@/components/meetings/bot-status-indicator";
-import { WsEventLog, RestTranscriptsPreview, RestRecordingsPreview } from "@/components/meetings/ws-event-log";
+import { WsEventLog, RestTranscriptsPreview } from "@/components/meetings/ws-event-log";
 // ChatPanel removed — chat messages now render inline in TranscriptViewer
 import { AIChatPanel } from "@/components/ai";
 import { useMeetingsStore } from "@/stores/meetings-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useLiveTranscripts } from "@/hooks/use-live-transcripts";
 import { PLATFORM_CONFIG, getDetailedStatus } from "@/types/vexa";
-import type { MeetingStatus, Meeting, RecordingData } from "@/types/vexa";
+import type { MeetingStatus, Meeting } from "@/types/vexa";
 import { StatusHistory } from "@/components/meetings/status-history";
 import { cn, parseUTCTimestamp } from "@/lib/utils";
 import { vexaAPI } from "@/lib/api";
@@ -106,7 +104,6 @@ export default function MeetingDetailPage() {
   const {
     currentMeeting,
     transcripts,
-    recordings,
     chatMessages,
     isLoadingMeeting,
     isLoadingTranscripts,
@@ -179,229 +176,6 @@ export default function MeetingDetailPage() {
     currentMeeting?.data?.languages?.[0] || "auto"
   );
   const [isUpdatingConfig, setIsUpdatingConfig] = useState(false);
-
-  // Audio playback state
-  const audioPlayerRef = useRef<AudioPlayerHandle>(null);
-  const videoPlayerRef = useRef<VideoPlayerHandle>(null);
-  const [playbackTime, setPlaybackTime] = useState<number | null>(null);
-  const [isPlaybackActive, setIsPlaybackActive] = useState(false);
-  const [pendingSeekTime, setPendingSeekTime] = useState<number | null>(null);
-  const [activeFragmentIndex, setActiveFragmentIndex] = useState(0);
-
-  // Build ordered recording fragments for multi-fragment playback.
-  // Each recording has a session_uid, created_at, and media_files with duration.
-  // Sort by created_at so fragments play sequentially.
-  //
-  // Pack U.8 (v0.10.6, re-applies reverted Pack D-3 — commit a62d658 — on
-  // top of the new master-recording contract from Pack U.5+U.6): resolve the
-  // canonical master route, then prefer the dashboard same-origin raw route
-  // for browser playback. This keeps proxied/local deployments working when
-  // the browser cannot directly reach the object-store public endpoint.
-  //
-  // The async fetch happens once per recordings change. While in flight,
-  // recordingFragments is the previous (or empty) array — the AudioPlayer
-  // shows a "Preparing audio…" state.
-  const [recordingFragments, setRecordingFragments] = useState<AudioFragment[]>([]);
-  const [videoSrc, setVideoSrc] = useState<string | null>(null);
-  // Surface connection errors from the master-stream-URL lookup. This is
-  // distinct from "master not ready yet" (404 -> null -> finalizing UI).
-  // v0.10.6.1 — a non-null value here means a real network/HTTP failure
-  // that the user should see, not be silently retried-into-empty-state.
-  const [playbackConnectionError, setPlaybackConnectionError] = useState<string | null>(null);
-
-  // v0.10.6.1 — ADR-2 canonical playback path. Dashboard reads
-  // `recording.playback_url.audio` (a stable backend route) and calls
-  // vexaAPI.getRecordingMasterStreamUrl() to resolve it to a presigned
-  // URL. No client-side picking from media_files[]. Null playback_url
-  // → render "finalizing" UI state (no silent fallback to chunk 0).
-  //
-  // The signature pattern from pre-fix avoided URL refetch storms when
-  // recordings[] reference changed but content didn't — kept here on
-  // the playback_url field directly.
-  const audioMediaSignature = useMemo(() => {
-    return recordings
-      .filter(r => (r.status === "completed" || r.status === "in_progress"))
-      .filter(r => r.playback_url?.audio)
-      .sort((a, b) => a.created_at.localeCompare(b.created_at))
-      .map(r => `${r.id}:${r.playback_url?.audio ?? ""}`)
-      .join("|");
-  }, [recordings]);
-
-  useEffect(() => {
-    if (!audioMediaSignature) {
-      setRecordingFragments([]);
-      setPlaybackConnectionError(null);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const availableRecordings = recordings
-        .filter(r => (r.status === "completed" || r.status === "in_progress") && r.playback_url?.audio)
-        .sort((a, b) => a.created_at.localeCompare(b.created_at));
-      try {
-        const results = await Promise.all(availableRecordings.map(async rec => {
-          const result = await vexaAPI.getRecordingMasterStreamUrl(rec.id, "audio");
-          if (!result) {
-            // 404 — master not ready for this recording yet.
-            return null;
-          }
-          return {
-            src: result.url,
-            duration: result.duration_seconds ?? 0,
-            sessionUid: rec.session_uid,
-            createdAt: rec.created_at,
-          } as AudioFragment;
-        }));
-        if (!cancelled) {
-          setRecordingFragments(results.filter((f): f is AudioFragment => f !== null));
-          setPlaybackConnectionError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setPlaybackConnectionError(err instanceof Error ? err.message : String(err));
-          setRecordingFragments([]);
-        }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [audioMediaSignature, recordings]);
-
-  const hasRecordingAudio = recordingFragments.length > 0;
-
-  // Find the first finalized video master across all recordings for the VideoPlayer.
-  // v0.10.6.1 ADR-2: read recording.playback_url.video; no client-side
-  // selection from media_files[].
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        for (const rec of recordings) {
-          if (rec.status !== "completed" && rec.status !== "in_progress") continue;
-          if (!rec.playback_url?.video) continue;
-          const result = await vexaAPI.getRecordingMasterStreamUrl(rec.id, "video");
-          if (!result) {
-            // 404 — video master not ready for this recording yet; try the next.
-            continue;
-          }
-          if (!cancelled) {
-            setVideoSrc(result.url);
-            setPlaybackConnectionError(null);
-          }
-          return;
-        }
-        if (!cancelled) setVideoSrc(null);
-      } catch (err) {
-        if (!cancelled) {
-          setPlaybackConnectionError(err instanceof Error ? err.message : String(err));
-          setVideoSrc(null);
-        }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [recordings]);
-
-  // Derive each session's start time (wall-clock ms) from segment data.
-  // segment.start_time is relative to session start, and segment.absolute_start_time
-  // is wall-clock UTC. So: sessionStart = absolute_start_time - start_time.
-  // We compute one per session_uid to support multi-fragment meetings.
-  const sessionStartMsBySessionUid = useMemo((): Map<string, number> => {
-    const map = new Map<string, number>();
-    for (const seg of transcripts) {
-      if (!seg.absolute_start_time || seg.start_time == null) continue;
-      const uid = seg.session_uid || "";
-      if (map.has(uid)) continue; // use the first segment per session
-      const absMs = new Date(seg.absolute_start_time).getTime();
-      const sessionMs = absMs - seg.start_time * 1000;
-      map.set(uid, sessionMs);
-    }
-    return map;
-  }, [transcripts]);
-
-  const handlePlaybackTimeUpdate = useCallback((time: number) => {
-    setPlaybackTime(time);
-    setIsPlaybackActive(true);
-  }, []);
-
-  const handleFragmentChange = useCallback((index: number) => {
-    setActiveFragmentIndex(index);
-  }, []);
-
-  // Map a segment click to the correct recording fragment and seek position.
-  //
-  // segment.start_time is relative to session start — the same reference point
-  // as the audio recording (both start from session start). So start_time IS
-  // the correct seek position within the recording fragment.
-  //
-  // For multi-fragment: use absolute_start_time + session_uid to find the right fragment,
-  // then use start_time as the seek offset within that fragment.
-  //
-  // KNOWN ISSUE: Audio playback seek is off by a few seconds when clicking segments.
-  // segment.start_time is relative to SegmentPublisher session start, but the recording
-  // (MediaRecorder) starts slightly later. resetSessionStart() in recording.ts reduces
-  // the gap but doesn't eliminate it — there's still a few-second delta between when
-  // the session start is reset and when MediaRecorder.start() actually fires inside
-  // page.evaluate(). A precise fix would require the browser to signal the exact
-  // MediaRecorder start timestamp back to Node.js.
-  const handleSegmentClick = useCallback((startTimeSeconds: number, absoluteStartTime?: string) => {
-    if (!hasRecordingAudio) {
-      setPendingSeekTime(startTimeSeconds);
-      return;
-    }
-
-    if (recordingFragments.length <= 1) {
-      // Single recording — start_time is the seek position
-      audioPlayerRef.current?.seekTo(startTimeSeconds);
-      videoPlayerRef.current?.seekTo(startTimeSeconds);
-      setPlaybackTime(startTimeSeconds);
-      setIsPlaybackActive(true);
-      return;
-    }
-
-    // Multi-fragment: find which fragment this segment belongs to
-    let targetFragmentIndex = 0;
-    if (absoluteStartTime) {
-      const segTimeMs = new Date(absoluteStartTime).getTime();
-      const matchingSegment = transcripts.find(
-        s => s.absolute_start_time === absoluteStartTime
-      );
-      if (matchingSegment?.session_uid) {
-        const uidIndex = recordingFragments.findIndex(
-          f => f.sessionUid === matchingSegment.session_uid
-        );
-        if (uidIndex >= 0) targetFragmentIndex = uidIndex;
-      } else {
-        // Fallback: find fragment by derived session start
-        for (let i = recordingFragments.length - 1; i >= 0; i--) {
-          const uid = recordingFragments[i].sessionUid;
-          const sessionStart = sessionStartMsBySessionUid.get(uid);
-          if (sessionStart != null && sessionStart <= segTimeMs) {
-            targetFragmentIndex = i;
-            break;
-          }
-        }
-      }
-    }
-
-    audioPlayerRef.current?.seekToFragment(targetFragmentIndex, startTimeSeconds);
-    const virtualOffset = recordingFragments
-      .slice(0, targetFragmentIndex)
-      .reduce((sum, f) => sum + (f.duration || 0), 0);
-    videoPlayerRef.current?.seekTo(virtualOffset + startTimeSeconds);
-    setPlaybackTime(virtualOffset + startTimeSeconds);
-    setIsPlaybackActive(true);
-  }, [hasRecordingAudio, recordingFragments, transcripts, sessionStartMsBySessionUid]);
-
-  useEffect(() => {
-    if (!hasRecordingAudio || pendingSeekTime == null) return;
-    const timer = setTimeout(() => {
-      audioPlayerRef.current?.seekTo(pendingSeekTime);
-      videoPlayerRef.current?.seekTo(pendingSeekTime);
-      setPlaybackTime(pendingSeekTime);
-      setIsPlaybackActive(true);
-      setPendingSeekTime(null);
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [hasRecordingAudio, pendingSeekTime]);
 
   // Track if initial load is complete to prevent animation replays
   const hasLoadedRef = useRef(false);
@@ -733,11 +507,10 @@ export default function MeetingDetailPage() {
   const meetingStatus = currentMeeting?.status;
   const isPostMeetingStatus =
     forcePostMeetingMode || meetingStatus === "stopping" || meetingStatus === "completed";
+  // Post-meeting transcript aggregation can lag the "completed" status event.
+  // Keep refreshing until transcript segments arrive, then stop.
   const shouldPollPostMeetingArtifacts =
-    isPostMeetingStatus &&
-    currentMeeting?.data?.recording_enabled !== false &&
-    !hasRecordingAudio &&
-    !playbackConnectionError;
+    isPostMeetingStatus && transcripts.length === 0;
 
   useEffect(() => {
     // Active browser sessions use VNC — no transcript fetch needed.
@@ -770,9 +543,8 @@ export default function MeetingDetailPage() {
     }
   }, [shouldUseWebSocket, meetingPlatform, meetingNativeId, fetchChatMessages]);
 
-  // Recording masters are finalized asynchronously after the bot stops. The
-  // status WebSocket can report "completed" before playback_url/audio is ready,
-  // so keep refreshing post-meeting artifacts until the player can render.
+  // Transcripts are aggregated asynchronously after the bot stops, so keep
+  // refreshing post-meeting artifacts until segments are available.
   useEffect(() => {
     if (!meetingId || !meetingPlatform || !meetingNativeId) return;
     if (!shouldPollPostMeetingArtifacts) return;
@@ -842,48 +614,6 @@ export default function MeetingDetailPage() {
     }
   }, [editedNotes]);
 
-  // Compute absolute playback time for transcript highlight matching.
-  // Convert the playback position to an absolute (wall-clock) ISO timestamp
-  // so the transcript viewer can match against segment absolute_start_time.
-  //
-  // Key insight: segment.start_time is relative to the session start (when
-  // SegmentPublisher was constructed), and the audio file also starts recording
-  // around the same time. So playbackTime (seconds from audio start) roughly
-  // equals seconds from session start. We derive the session start wall-clock
-  // time from the segments: sessionStart = absolute_start_time - start_time.
-  //
-  // Previously this used recording.created_at, which is the upload time — not
-  // when the recording actually started — causing a large offset.
-  // Convert playback position (seconds from session start) to absolute wall-clock
-  // time so the transcript viewer can highlight the matching segment.
-  //
-  // NOTE: returns an ISO string WITH `Z` (UTC). This is intentional — the
-  // value is consumed by formatAbsoluteTimestamp() in transcript-segment.tsx
-  // which calls parseUTCTimestamp() then renders in browser-local tz. Do not
-  // "fix" this to a local-tz string; that would cause a double-shift.
-  const playbackAbsoluteTime = useMemo((): string | null => {
-    if (playbackTime == null || !isPlaybackActive || recordingFragments.length === 0) return null;
-    if (recordingFragments.length === 1) {
-      const uid = recordingFragments[0].sessionUid;
-      const sessionStart = sessionStartMsBySessionUid.get(uid);
-      if (sessionStart == null) return null;
-      return new Date(sessionStart + playbackTime * 1000).toISOString();
-    }
-    // Multi-fragment: find which fragment the virtual time falls in
-    let remaining = playbackTime;
-    for (let i = 0; i < recordingFragments.length; i++) {
-      const fragDur = recordingFragments[i].duration || 0;
-      if (remaining <= fragDur || i === recordingFragments.length - 1) {
-        const uid = recordingFragments[i].sessionUid;
-        const sessionStart = sessionStartMsBySessionUid.get(uid);
-        if (sessionStart == null) return null;
-        return new Date(sessionStart + remaining * 1000).toISOString();
-      }
-      remaining -= fragDur;
-    }
-    return null;
-  }, [playbackTime, isPlaybackActive, recordingFragments, sessionStartMsBySessionUid]);
-
   // Browser session check runs first — transcript errors must not block the VNC view.
   // The transcript fetch is skipped for active browser sessions, but if a stale error
   // exists in the store (e.g. from a prior page visit), we still want to show the VNC.
@@ -931,62 +661,6 @@ export default function MeetingDetailPage() {
             60000
         )
       : null;
-  const isPostMeetingFlow =
-    forcePostMeetingMode ||
-    currentMeeting.status === "stopping" || currentMeeting.status === "completed";
-  const meetingRecordings = Array.isArray(currentMeeting.data?.recordings)
-    ? (currentMeeting.data.recordings as RecordingData[])
-    : [];
-  const effectiveRecordings = recordings.length > 0 ? recordings : meetingRecordings;
-  const hasRecordingEntries = effectiveRecordings.length > 0;
-  const hasActiveRecording = effectiveRecordings.some((recording) =>
-    recording.status === "in_progress" || recording.status === "uploading"
-  );
-  const recordingWasRequested = currentMeeting.data?.recording_enabled !== false;
-  const noAudioRecordingForMeeting =
-    currentMeeting.data?.recording_enabled === false && !hasRecordingAudio;
-  const missingRequestedRecording =
-    isPostMeetingFlow && recordingWasRequested && currentMeeting.status === "completed" && !hasRecordingEntries;
-  const canUseSegmentPlayback = isPostMeetingFlow && !noAudioRecordingForMeeting && !missingRequestedRecording;
-  const recordingTopBar = (isPostMeetingFlow || hasActiveRecording) ? (
-    hasActiveRecording && !isPostMeetingFlow ? (
-      <div className="flex items-center gap-2 px-4 py-2 bg-muted/50 rounded-lg border text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Recording in progress...
-      </div>
-    ) : playbackConnectionError ? (
-      <div className="flex items-center gap-2 px-4 py-2 bg-destructive/10 rounded-lg border border-destructive/30 text-sm text-destructive">
-        Connection error loading recording: {playbackConnectionError}
-      </div>
-    ) : hasRecordingAudio ? (
-      <div className="flex flex-col gap-2">
-        {videoSrc && (
-          <VideoPlayer ref={videoPlayerRef} src={videoSrc} className="max-h-[360px]" />
-        )}
-        <AudioPlayer
-          ref={audioPlayerRef}
-          fragments={recordingFragments}
-          onTimeUpdate={handlePlaybackTimeUpdate}
-          onFragmentChange={handleFragmentChange}
-          compact
-        />
-      </div>
-    ) : noAudioRecordingForMeeting ? (
-      <div className="flex items-center gap-2 px-4 py-2 bg-muted/50 rounded-lg border text-sm text-muted-foreground">
-        No audio recording for this meeting.
-      </div>
-    ) : missingRequestedRecording ? (
-      <div className="flex items-center gap-2 px-4 py-2 bg-muted/50 rounded-lg border text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Recording is finalizing...
-      </div>
-    ) : (
-      <div className="flex items-center gap-2 px-4 py-2 bg-muted/50 rounded-lg border text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Recording is processing...
-      </div>
-    )
-  ) : null;
 
   const formatDuration = (minutes: number) => {
     if (minutes < 60) return `${minutes} min`;
@@ -1284,21 +958,6 @@ export default function MeetingDetailPage() {
                     <ClipboardCopy className="h-4 w-4 mr-2" />
                     Copy to clipboard
                   </DropdownMenuItem>
-                  {hasRecordingAudio && (
-                    <DropdownMenuItem
-                      onClick={() => {
-                        if (recordingFragments.length > 0) {
-                          const link = document.createElement("a");
-                          link.href = recordingFragments[0].src;
-                          link.download = `${currentMeeting?.data?.name || currentMeeting?.data?.title || "recording"}.webm`;
-                          link.click();
-                        }
-                      }}
-                    >
-                      <Download className="h-4 w-4 mr-2" />
-                      Download audio
-                    </DropdownMenuItem>
-                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
               <DocsLink href="/docs/cookbook/share-transcript-url" />
@@ -1621,21 +1280,6 @@ export default function MeetingDetailPage() {
                       <ClipboardCopy className="h-4 w-4 mr-2" />
                       Copy to clipboard
                     </DropdownMenuItem>
-                    {hasRecordingAudio && (
-                      <DropdownMenuItem
-                        onClick={() => {
-                          if (recordingFragments.length > 0) {
-                            const link = document.createElement("a");
-                            link.href = recordingFragments[0].src;
-                            link.download = `${currentMeeting?.data?.name || currentMeeting?.data?.title || "recording"}.webm`;
-                            link.click();
-                          }
-                        }}
-                      >
-                        <Download className="h-4 w-4 mr-2" />
-                        Download audio
-                      </DropdownMenuItem>
-                    )}
                 </DropdownMenuContent>
               </DropdownMenu>
               <DocsLink href="/docs/cookbook/share-transcript-url" />
@@ -1923,17 +1567,6 @@ export default function MeetingDetailPage() {
               wsError={wsError}
               wsReconnectAttempts={reconnectAttempts}
               headerActions={<DocsLink href="/docs/cookbook/get-transcripts" />}
-              topBarContent={recordingTopBar}
-              playbackTime={playbackTime}
-              playbackAbsoluteTime={playbackAbsoluteTime}
-              isPlaybackActive={isPlaybackActive}
-              onSegmentClick={canUseSegmentPlayback ? handleSegmentClick : undefined}
-              onTranscribeComplete={() => {
-                fetchMeeting(meetingId);
-                if (currentMeeting?.platform && currentMeeting?.platform_specific_id) {
-                  fetchTranscripts(currentMeeting.platform, currentMeeting.platform_specific_id, String(currentMeeting.id));
-                }
-              }}
             />
           )}
           </>)}
@@ -1964,11 +1597,6 @@ export default function MeetingDetailPage() {
               platform={currentMeeting.platform}
               nativeId={currentMeeting.platform_specific_id}
               segmentCount={transcripts.length}
-              token={authToken}
-            />
-            <RestRecordingsPreview
-              platform={currentMeeting.platform}
-              nativeId={currentMeeting.platform_specific_id}
               token={authToken}
             />
             </>

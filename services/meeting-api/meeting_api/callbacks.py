@@ -33,7 +33,6 @@ from .meetings import (
     get_redis,
 )
 from .post_meeting import run_all_tasks
-from .recording_finalizer import finalize_recording_master
 from .collector.auth import require_internal_secret
 
 logger = logging.getLogger("meeting_api.callbacks")
@@ -49,7 +48,7 @@ logger = logging.getLogger("meeting_api.callbacks")
 # the silent class by inspecting the same fields the data showed:
 #   - reached_active (from status_transition[]) → distinguishes 432 class
 #   - duration_seconds (from start_time/end_time) → 30s threshold
-#   - transcribe_enabled (from data) → opt-out for recording-only mode
+#   - transcribe_enabled (from data) → opt-out when transcription disabled
 #   - transcription_count (count(*) from transcriptions table)
 def _failure_stage_from_status(status: str) -> MeetingFailureStage:
     """Derive failure_stage from current meeting.status at write time.
@@ -177,47 +176,8 @@ async def _classify_stopped_exit(
         return (MeetingStatus.COMPLETED, requested_reason)
 
     if segment_count == 0:
-        # v0.10.5 (post-prod-telemetry 2026-04-30) — DELIVERY-AWARE classification.
-        #
-        # Pre-fix: any meeting with transcribe_enabled and 0 transcripts was
-        # routed to FAILED/STOPPED_WITH_NO_AUDIO. This conflated two distinct
-        # outcomes:
-        #   (a) Bot couldn't capture audio at all (real failure)
-        #   (b) Bot DID capture audio (e.g. recording_enabled=true produced a
-        #       multi-MB WAV/webm file delivered to MinIO) but no SPEECH was
-        #       present in the captured audio — silent or quiet meeting.
-        #
-        # (b) is a successful capture from the customer's perspective: the
-        # recording is on disk, downloadable, replayable. Marking the whole
-        # meeting as `failed` lies — and the dashboard hides the recording
-        # because of the failed status, double-burying the delivered artifact.
-        #
-        # Honest fix: if a recording WAS delivered (chunk_count > 0 or any
-        # media_files entry exists with non-zero file_size_bytes), the meeting
-        # COMPLETED — we delivered what was captured. Only fall through to
-        # STOPPED_WITH_NO_AUDIO for the case where neither transcripts nor a
-        # recording entry exists.
-        recordings = data.get("recordings") or []
-        recording_delivered = False
-        for rec in recordings:
-            if not isinstance(rec, dict):
-                continue
-            for mf in (rec.get("media_files") or []):
-                if not isinstance(mf, dict):
-                    continue
-                if int(mf.get("file_size_bytes") or 0) > 0:
-                    recording_delivered = True
-                    break
-            if recording_delivered:
-                break
-
-        if recording_delivered:
-            # Recording delivered, no transcripts → silent/quiet meeting,
-            # not a failure. Map to the closest non-failure reason.
-            return (MeetingStatus.COMPLETED, requested_reason)
-
-        # 125-case: bot was active for 30s+ with transcribe enabled, no
-        # transcripts AND no recording delivered. Real failure — silent class.
+        # Bot was active for 30s+ with transcribe enabled but produced no
+        # transcripts. Real failure — silent class (STOPPED_WITH_NO_AUDIO).
         return (MeetingStatus.FAILED, MeetingCompletionReason.STOPPED_WITH_NO_AUDIO)
 
     return (MeetingStatus.COMPLETED, requested_reason)
@@ -323,18 +283,6 @@ async def bot_exit_callback(
             meta = {"exit_code": exit_code}
             if payload.platform_specific_error:
                 meta["platform_specific_error"] = payload.platform_specific_error
-            # Pack U.7 (v0.10.6) — build master.{webm|wav} from chunks BEFORE status flip,
-            # so post-meeting transcribe and dashboard playback never read a stale
-            # storage_path. Idempotent (HEAD-checks for existing master).
-            try:
-                await finalize_recording_master(meeting.id, db)
-            except Exception as fin_err:
-                logger.error(
-                    "Exit callback: finalize_recording_master failed for meeting %s — "
-                    "continuing with status update (master may be absent; operator can "
-                    "re-trigger). error_class=%s error=%s",
-                    meeting.id, type(fin_err).__name__, str(fin_err)[:200],
-                )
             success = await update_meeting_status(
                 meeting, MeetingStatus.COMPLETED, db,
                 completion_reason=provided_reason,
@@ -383,18 +331,6 @@ async def bot_exit_callback(
                 f"(was: completed reason={provided_reason.value})"
             )
             meta = {"exit_code": exit_code, "original_reason": payload.reason, "pack_j_classification": classified_reason.value}
-            # Pack U.7 (v0.10.6) — build master.{webm|wav} from chunks BEFORE status flip,
-            # so post-meeting transcribe and dashboard playback never read a stale
-            # storage_path. Idempotent (HEAD-checks for existing master).
-            try:
-                await finalize_recording_master(meeting.id, db)
-            except Exception as fin_err:
-                logger.error(
-                    "Exit callback: finalize_recording_master failed for meeting %s — "
-                    "continuing with status update (master may be absent; operator can "
-                    "re-trigger). error_class=%s error=%s",
-                    meeting.id, type(fin_err).__name__, str(fin_err)[:200],
-                )
             success = await update_meeting_status(
                 meeting, target_status, db,
                 completion_reason=classified_reason,
@@ -492,18 +428,6 @@ async def bot_exit_callback(
                 if payload.reason:
                     error_msg += f"; reason: {payload.reason}"
                 update_kwargs["error_details"] = error_msg
-            # Pack U.7 (v0.10.6) — build master.{webm|wav} from chunks BEFORE status flip,
-            # so post-meeting transcribe and dashboard playback never read a stale
-            # storage_path. Idempotent (HEAD-checks for existing master).
-            try:
-                await finalize_recording_master(meeting.id, db)
-            except Exception as fin_err:
-                logger.error(
-                    "Exit callback: finalize_recording_master failed for meeting %s — "
-                    "continuing with status update (master may be absent; operator can "
-                    "re-trigger). error_class=%s error=%s",
-                    meeting.id, type(fin_err).__name__, str(fin_err)[:200],
-                )
             success = await update_meeting_status(
                 meeting, target_status, db, **update_kwargs
             )

@@ -24,7 +24,7 @@ DOCKERHUB_USER ?= vexaai
 # All images that get built and published.
 # agent-api remains NO-SHIP for v0.10.x (see docker-compose.yml); do not
 # promote a non-deployed image to :dev/:latest as part of public releases.
-IMAGES := api-gateway admin-api runtime-api meeting-api mcp dashboard tts-service vexa-lite
+IMAGES := api-gateway admin-api runtime-api meeting-api dashboard
 BOT_IMAGE := vexa-bot
 
 -include $(ENV_FILE)
@@ -175,7 +175,7 @@ build-transcript-rendering:
 	@echo "Building transcript-rendering package..."
 	@cd $(ROOT)/packages/transcript-rendering && npm install && npm run build
 
-build: check_docker build-bot-image build-transcript-rendering build-lite
+build: check_docker build-bot-image build-transcript-rendering
 	@echo "Building all images with tag: $(BUILD_TAG)"
 	@# v0.10.5.3 Pack D-1 follow-up: VEXA_VERSION + VEXA_RELEASE_DATE are
 	@# read by docker-compose.yml's dashboard service `args:` block to feed

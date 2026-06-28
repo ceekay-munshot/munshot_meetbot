@@ -23,6 +23,59 @@ ACCEPTED_LANGUAGE_CODES = {
     "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo", "zh", "yue"
 }
 
+# Map full English language names -> faster-whisper ISO codes. Legacy rows written
+# while Groq was the active provider stored the full name ("English"); the
+# transcription service now normalizes at the boundary, but this lets the read path
+# rescue those already-persisted rows instead of dropping the whole segment.
+_LANGUAGE_NAME_TO_CODE = {
+    "english": "en", "chinese": "zh", "mandarin": "zh", "cantonese": "yue",
+    "german": "de", "spanish": "es", "russian": "ru", "korean": "ko",
+    "french": "fr", "japanese": "ja", "portuguese": "pt", "turkish": "tr",
+    "polish": "pl", "catalan": "ca", "dutch": "nl", "arabic": "ar",
+    "swedish": "sv", "italian": "it", "indonesian": "id", "hindi": "hi",
+    "finnish": "fi", "vietnamese": "vi", "hebrew": "he", "ukrainian": "uk",
+    "greek": "el", "malay": "ms", "czech": "cs", "romanian": "ro",
+    "danish": "da", "hungarian": "hu", "tamil": "ta", "norwegian": "no",
+    "nynorsk": "nn", "thai": "th", "urdu": "ur", "croatian": "hr",
+    "bulgarian": "bg", "lithuanian": "lt", "latin": "la", "maori": "mi",
+    "malayalam": "ml", "welsh": "cy", "slovak": "sk", "telugu": "te",
+    "persian": "fa", "latvian": "lv", "bengali": "bn", "serbian": "sr",
+    "azerbaijani": "az", "slovenian": "sl", "kannada": "kn", "estonian": "et",
+    "macedonian": "mk", "breton": "br", "basque": "eu", "icelandic": "is",
+    "armenian": "hy", "nepali": "ne", "mongolian": "mn", "bosnian": "bs",
+    "kazakh": "kk", "albanian": "sq", "swahili": "sw", "galician": "gl",
+    "marathi": "mr", "punjabi": "pa", "sinhala": "si", "khmer": "km",
+    "shona": "sn", "yoruba": "yo", "somali": "so", "afrikaans": "af",
+    "occitan": "oc", "georgian": "ka", "belarusian": "be", "tajik": "tg",
+    "sindhi": "sd", "gujarati": "gu", "amharic": "am", "yiddish": "yi",
+    "lao": "lo", "uzbek": "uz", "faroese": "fo", "haitian creole": "ht",
+    "pashto": "ps", "turkmen": "tk", "maltese": "mt", "sanskrit": "sa",
+    "luxembourgish": "lb", "myanmar": "my", "burmese": "my", "tibetan": "bo",
+    "tagalog": "tl", "malagasy": "mg", "assamese": "as", "tatar": "tt",
+    "hawaiian": "haw", "lingala": "ln", "hausa": "ha", "bashkir": "ba",
+    "javanese": "jw", "sundanese": "su",
+}
+
+
+def normalize_language_code(value: Optional[str]) -> Optional[str]:
+    """Coerce a language label to an accepted faster-whisper ISO code, or None.
+
+    Accepts bare codes ("en"), full names ("English"), and region-suffixed tags
+    ("en-US"). Returns None for empty/unmappable values so the read path can keep
+    a segment without a language rather than discarding it entirely.
+    """
+    if value is None or value == "":
+        return None
+    v = value.strip().lower()
+    if v in ACCEPTED_LANGUAGE_CODES:
+        return v
+    if v in _LANGUAGE_NAME_TO_CODE:
+        return _LANGUAGE_NAME_TO_CODE[v]
+    base = v.split("-", 1)[0]
+    if base in ACCEPTED_LANGUAGE_CODES:
+        return base
+    return None
+
 # --- Allowed Tasks ---
 ALLOWED_TASKS = {"transcribe", "translate"}
 
@@ -207,10 +260,8 @@ class Platform(str, Enum):
     The value is the external API name, while the bot_name is what's used internally by the bot.
     """
     GOOGLE_MEET = "google_meet"
-    ZOOM = "zoom"
-    TEAMS = "teams"
     BROWSER_SESSION = "browser_session"
-    
+
     @property
     def bot_name(self) -> str:
         """
@@ -219,8 +270,6 @@ class Platform(str, Enum):
         """
         mapping = {
             Platform.GOOGLE_MEET: "google_meet",
-            Platform.ZOOM: "zoom",
-            Platform.TEAMS: "teams"
         }
         return mapping[self]
     
@@ -251,8 +300,6 @@ class Platform(str, Enum):
         """
         reverse_mapping = {
             "google_meet": Platform.GOOGLE_MEET.value,
-            "zoom": Platform.ZOOM.value,
-            "teams": Platform.TEAMS.value
         }
         return reverse_mapping.get(bot_platform_name)
 
@@ -281,25 +328,6 @@ class Platform(str, Enum):
                 if re.fullmatch(r"^[a-z]{3}-[a-z]{4}-[a-z]{3}$", native_id) or \
                    re.fullmatch(r"^[a-z0-9][a-z0-9-]{3,38}[a-z0-9]$", native_id):
                     return f"https://meet.google.com/{native_id}"
-                return None
-            elif platform == Platform.TEAMS:
-                # Hex hash = long legacy URL; caller must use raw meeting_url field
-                if re.fullmatch(r"^[0-9a-f]{16}$", native_id):
-                    return None
-                if re.fullmatch(r"^\d{10,15}$", native_id):
-                    host = base_host or "teams.live.com"
-                    url = f"https://{host}/meet/{native_id}"
-                    if passcode:
-                        url += f"?p={passcode}"
-                    return url
-                return None
-            elif platform == Platform.ZOOM:
-                # Zoom meeting ID (numeric, 9-11 digits) and optional passcode
-                if re.fullmatch(r"^\d{9,11}$", native_id):
-                    base_url = f"https://zoom.us/j/{native_id}"
-                    if passcode:
-                        return f"{base_url}?pwd={passcode}"
-                    return base_url
                 return None
             elif platform == Platform.BROWSER_SESSION:
                 # Browser sessions use opaque IDs (UUIDs, etc.) — no meeting URL to construct
@@ -415,36 +443,19 @@ class AutomaticLeave(BaseModel):
         return self
 
 
-_TEAMS_ENTERPRISE_HOSTS = {
-    "teams.microsoft.com",
-    "gov.teams.microsoft.us",
-    "dod.teams.microsoft.us",
-}
-
-
-def _is_teams_host(host: str) -> bool:
-    return host in _TEAMS_ENTERPRISE_HOSTS or host.endswith(".teams.microsoft.us") or host.endswith(".teams.microsoft.com")
-
-
 def parse_meeting_url(url: str) -> dict:
-    """Parse a meeting URL into platform, native_meeting_id, passcode, etc.
+    """Parse a Google Meet URL into platform + native_meeting_id.
 
-    Returns a dict with keys: platform, native_meeting_id, passcode, meeting_url, teams_base_host.
-    Raises ValueError on unrecognised or invalid URLs.
+    Returns a dict with keys: platform, native_meeting_id.
+    Raises ValueError on unrecognised or invalid URLs. (Google Meet only.)
     """
     url = (url or "").strip()
     if not url:
         raise ValueError("meeting_url cannot be empty")
 
-    # Handle msteams: deep links by converting to https for urlparse
-    parse_url = url
-    if url.lower().startswith("msteams:"):
-        parse_url = "https://teams.microsoft.com" + url[len("msteams:"):]
-
-    parsed = urlparse(parse_url)
+    parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     path = parsed.path or ""
-    query = parse_qs(parsed.query or "")
 
     # Google Meet
     if host == "meet.google.com":
@@ -457,70 +468,7 @@ def parse_meeting_url(url: str) -> dict:
             return {"platform": "google_meet", "native_meeting_id": code}
         raise ValueError("Invalid Google Meet URL: expected https://meet.google.com/abc-defg-hij")
 
-    # Teams personal (teams.live.com/meet/<digits>?p=<passcode>)
-    if host.endswith("teams.live.com"):
-        m = re.match(r"^/meet/(\d{10,15})/?$", path)
-        if not m:
-            raise ValueError("Unsupported teams.live.com URL format. Expected /meet/<10-15 digit id>.")
-        return {
-            "platform": "teams",
-            "native_meeting_id": m.group(1),
-            "passcode": (query.get("p") or [None])[0],
-        }
-
-    # Teams enterprise
-    if _is_teams_host(host):
-        # Deep link: /v2/?meetingjoin=true#/meet/<id>?p=<passcode>
-        fragment = parsed.fragment or ""
-        if path.rstrip("/") in ("/v2", "") and fragment.startswith("/meet/"):
-            frag_parsed = urlparse("https://x" + fragment)
-            fm = re.match(r"^/meet/(\d{10,15})/?$", frag_parsed.path)
-            if fm:
-                frag_query = parse_qs(frag_parsed.query or "")
-                return {
-                    "platform": "teams",
-                    "native_meeting_id": fm.group(1),
-                    "passcode": (frag_query.get("p") or [None])[0],
-                    "teams_base_host": host,
-                }
-
-        # Short URL: /meet/<numeric_id>?p=<passcode>
-        m = re.match(r"^/meet/(\d{10,15})/?$", path)
-        if m:
-            return {
-                "platform": "teams",
-                "native_meeting_id": m.group(1),
-                "passcode": (query.get("p") or [None])[0],
-                "teams_base_host": host,
-            }
-
-        # Long legacy URL: /l/meetup-join/...
-        if "/l/meetup-join/" in path:
-            url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-            return {
-                "platform": "teams",
-                "native_meeting_id": url_hash,
-                "meeting_url": url,
-            }
-        raise ValueError("Unsupported Teams URL format. Expected /meet/<id>?p=<passcode> or /l/meetup-join/...")
-
-    # Zoom — canonical zoom.us / zoomgov.com hosts
-    if "zoom.us" in host or "zoomgov.com" in host:
-        parts = [p for p in path.split("/") if p]
-        native_id = ""
-        if len(parts) >= 2 and parts[0] in {"j", "w"}:
-            native_id = parts[1]
-        elif len(parts) >= 3 and parts[0] == "wc" and parts[1] == "join":
-            native_id = parts[2]
-        if not re.fullmatch(r"\d{9,11}", native_id or ""):
-            raise ValueError("Unsupported Zoom URL format. Expected https://zoom.us/j/<9-11 digit id>.")
-        return {
-            "platform": "zoom",
-            "native_meeting_id": native_id,
-            "passcode": (query.get("pwd") or [None])[0],
-        }
-
-    raise ValueError("Unsupported meeting URL (unknown provider).")
+    raise ValueError("Unsupported meeting URL (Google Meet only).")
 
 
 class MeetingCreate(BaseModel):
@@ -534,10 +482,6 @@ class MeetingCreate(BaseModel):
     transcription_tier: Optional[str] = Field(
         "realtime",
         description="Transcription priority tier: 'realtime' (default) or 'deferred'"
-    )
-    recording_enabled: Optional[bool] = Field(
-        None,
-        description="Optional per-meeting override for recording persistence (true/false)."
     )
     transcribe_enabled: Optional[bool] = Field(
         None,
@@ -573,12 +517,7 @@ class MeetingCreate(BaseModel):
         s = (v or "").strip()
         if not s:
             return v
-        # msteams: deep links — convert to https for urlparse, same as
-        # parse_meeting_url. Treat as valid if the post-rewrite URL parses.
-        check = s
-        if s.lower().startswith("msteams:"):
-            check = "https://teams.microsoft.com" + s[len("msteams:"):]
-        parsed = urlparse(check)
+        parsed = urlparse(s)
         if not parsed.scheme or not parsed.netloc:
             raise ValueError(
                 f"meeting_url is not a well-formed URL "
@@ -586,14 +525,6 @@ class MeetingCreate(BaseModel):
                 f"Provide a full URL (https://...)."
             )
         return v
-    teams_base_host: Optional[str] = Field(
-        None,
-        description="Internal: Teams hostname for short enterprise URLs (e.g. 'teams.microsoft.com', 'gov.teams.microsoft.us'). Populated automatically by the MCP parser."
-    )
-    zoom_obf_token: Optional[str] = Field(
-        None,
-        description="Optional one-time Zoom OBF token. If omitted for Zoom meetings, the backend will mint one from the user's stored Zoom OAuth connection."
-    )
     voice_agent_enabled: Optional[bool] = Field(
         False,
         description="Enable voice agent (TTS, chat, screen share, avatar streaming) capabilities for this meeting"
@@ -613,10 +544,6 @@ class MeetingCreate(BaseModel):
     mode: Optional[str] = Field(
         None,
         description="Bot mode: 'browser_session' for remote browser access, or None for default meeting mode."
-    )
-    video: Optional[bool] = Field(
-        False,
-        description="Enable video recording (Xvfb screen capture of the bot's browser view). Default: off. When true, sets recording_enabled=true and capture_modes=['audio', 'video']. Opt-in — leaving this false (or unset) gives audio-only recording, which is the expected default for transcription-focused deployments."
     )
     authenticated: Optional[bool] = Field(
         False,
@@ -656,25 +583,9 @@ class MeetingCreate(BaseModel):
     @field_validator('passcode')
     @classmethod
     def validate_passcode(cls, v, info: ValidationInfo):
-        """Validate passcode usage based on platform"""
-        platform = info.data.get('platform') if info.data else None
-        if platform == Platform.TEAMS:
-            if not v or v == "":
-                raise ValueError("Passcode is required for Teams meetings. Without it, bots cannot join (lobby rejects anonymous guests).")
-            if not re.match(r'^[A-Za-z0-9]{4,20}$', v):
-                raise ValueError("Teams passcode must be 4-20 alphanumeric characters")
-        elif platform == Platform.GOOGLE_MEET and v is not None and v != "":
-            raise ValueError("Passcode is not supported for Google Meet meetings")
-        return v
-
-    @field_validator('zoom_obf_token')
-    @classmethod
-    def validate_zoom_obf_token(cls, v, info: ValidationInfo):
-        """Validate OBF token usage based on platform."""
+        """Passcodes are not used by Google Meet (the only supported platform)."""
         if v is not None and v != "":
-            platform = info.data.get('platform') if info.data else None
-            if platform != Platform.ZOOM:
-                raise ValueError("zoom_obf_token is only supported for Zoom meetings")
+            raise ValueError("Passcode is not supported for Google Meet meetings")
         return v
 
     @field_validator('language')
@@ -728,18 +639,6 @@ class MeetingCreate(BaseModel):
                not re.fullmatch(r"^[a-z0-9][a-z0-9-]{3,38}[a-z0-9]$", native_id):
                 raise ValueError("Google Meet ID must be in format 'abc-defg-hij' or a custom nickname (5-40 lowercase alphanumeric/hyphen chars)")
 
-        elif platform == Platform.TEAMS:
-            # Reject full URLs up front
-            if native_id.startswith(('http://', 'https://', 'teams.')):
-                raise ValueError("Teams meeting ID must be the numeric ID or hash, not a full URL")
-            # Accept numeric ID (10-15 digits) or 16-char hex hash (for legacy /l/meetup-join/ URLs)
-            if not re.fullmatch(r"^\d{10,15}$", native_id) and \
-               not re.fullmatch(r"^[0-9a-f]{16}$", native_id):
-                raise ValueError(
-                    "Teams native_meeting_id must be a 10-15 digit numeric ID "
-                    "or a 16-character hex hash (for legacy /l/meetup-join/ URLs)"
-                )
-        
         return v
 
     @field_validator('mode')
@@ -782,12 +681,6 @@ class MeetingCreate(BaseModel):
                 data["platform"] = parsed["platform"]
             if parsed.get("native_meeting_id"):
                 data["native_meeting_id"] = parsed["native_meeting_id"]
-            if parsed.get("passcode") and not data.get("passcode"):
-                data["passcode"] = parsed["passcode"]
-            if parsed.get("meeting_url"):
-                data["meeting_url"] = parsed["meeting_url"]
-            if parsed.get("teams_base_host") and not data.get("teams_base_host"):
-                data["teams_base_host"] = parsed["teams_base_host"]
         except ValueError:
             # Parser doesn't recognize this URL shape (white-label /
             # enterprise / brand-new vendor). That's fine — if the user
@@ -823,9 +716,6 @@ class MeetingCreate(BaseModel):
                 "Either provide platform + native_meeting_id, OR platform + meeting_url, "
                 "OR set agent_enabled=true, OR set mode='browser_session'"
             )
-        # Teams requires passcode — without it bots can't pass the lobby
-        if has_meeting and self.platform == Platform.TEAMS and not self.meeting_url and not self.passcode:
-            raise ValueError("Teams meetings require a passcode. Without it, bots cannot join (lobby rejects anonymous guests). Provide the 'passcode' field.")
         return self
 
 class MeetingResponse(BaseModel): # Not inheriting from MeetingBase anymore to avoid duplicate fields if DB model is used directly
@@ -1055,10 +945,22 @@ class TranscriptionSegment(BaseModel):
     @field_validator('language')
     @classmethod
     def validate_language(cls, v):
-        """Validate that the language code is one of the accepted faster-whisper codes."""
-        if v is not None and v != "" and v not in ACCEPTED_LANGUAGE_CODES:
-            raise ValueError(f"Invalid language code '{v}'. Must be one of: {sorted(ACCEPTED_LANGUAGE_CODES)}")
-        return v
+        """Read-tolerant language coercion.
+
+        This is a response model built from already-persisted rows, so a stray
+        value (e.g. a legacy full name like 'English', or a region-suffixed
+        'en-US') must NOT raise — that would drop the entire segment from the
+        transcript. Coerce to an accepted code when possible; otherwise warn and
+        fall back to None so the segment is still returned without a language.
+        """
+        if v is None or v == "":
+            return v
+        if v in ACCEPTED_LANGUAGE_CODES:
+            return v
+        normalized = normalize_language_code(v)
+        if normalized is None:
+            logger.warning("Unrecognized language %r on transcript segment; coercing to None", v)
+        return normalized
 
     class Config:
         from_attributes = True
@@ -1075,7 +977,6 @@ class TranscriptionResponse(BaseModel): # Doesn't inherit MeetingResponse to avo
     status: str
     start_time: Optional[datetime]
     end_time: Optional[datetime]
-    recordings: List[Dict[str, Any]] = Field(default_factory=list, description="Recording metadata attached to the meeting (if available).")
     notes: Optional[str] = Field(None, description="Meeting notes (from meeting data, if provided).")
     data: Optional[Dict[str, Any]] = Field(None, description="Meeting data (mode, session_token, etc.)")
     # ---
@@ -1236,59 +1137,6 @@ class UserAnalyticsResponse(BaseModel):
     usage_patterns: UserUsagePatterns
     api_tokens: Optional[List[TokenResponse]]  # Optional for security
 # --- END Analytics Schemas ---
-
-# --- Recording Schemas ---
-
-class RecordingStatus(str, Enum):
-    IN_PROGRESS = "in_progress"
-    UPLOADING = "uploading"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-class RecordingSource(str, Enum):
-    BOT = "bot"
-    UPLOAD = "upload"
-    URL = "url"
-
-class MediaFileType(str, Enum):
-    AUDIO = "audio"
-    VIDEO = "video"
-    SCREENSHOT = "screenshot"
-
-class MediaFileResponse(BaseModel):
-    id: int
-    type: MediaFileType
-    format: str
-    storage_backend: str
-    file_size_bytes: Optional[int] = None
-    duration_seconds: Optional[float] = None
-    metadata: Optional[Dict[str, Any]] = Field(None, validation_alias="extra_metadata")
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-        use_enum_values = True
-        populate_by_name = True
-
-class RecordingResponse(BaseModel):
-    id: int
-    meeting_id: Optional[int] = None
-    user_id: int
-    session_uid: Optional[str] = None
-    source: RecordingSource
-    status: RecordingStatus
-    error_message: Optional[str] = None
-    created_at: datetime
-    completed_at: Optional[datetime] = None
-    media_files: List[MediaFileResponse] = Field(default_factory=list)
-
-    class Config:
-        from_attributes = True
-        use_enum_values = True
-
-class RecordingListResponse(BaseModel):
-    recordings: List[RecordingResponse]
-# --- END Recording Schemas ---
 
 
 # --- Voice Agent / Meeting Interaction Schemas ---

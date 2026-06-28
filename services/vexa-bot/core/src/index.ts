@@ -11,6 +11,11 @@ import { getZoomSpeakerEvents } from "./platforms/zoom/strategies/recording";
 import { browserArgs, getBrowserArgs, getAuthenticatedBrowserArgs, userAgent } from "./constans";
 import { BotConfig } from "./types";
 import { RecordingService } from "./services/recording";
+import {
+  stopActiveSpeakerSampler,
+  getActiveSpeakerTimeline,
+  uploadActiveSpeakerTimeline,
+} from "./services/active-speaker-timeline";
 import { VideoRecordingService } from "./services/video-recording";
 import { TTSPlaybackService } from "./services/tts-playback";
 import { MicrophoneService } from "./services/microphone";
@@ -807,6 +812,27 @@ async function performGracefulLeave(
       await activeRecordingService.cleanup();
       activeRecordingService = null;
     }
+  }
+
+  // Upload the active-speaker timeline so the post-meeting batch job can map
+  // Deepgram diarization indices to participant names. Best-effort.
+  try {
+    stopActiveSpeakerSampler();
+    if (currentBotConfig?.speakerTimelineUploadUrl && currentBotConfig?.token) {
+      const timeline = getActiveSpeakerTimeline();
+      if (timeline.samples.length > 0) {
+        await uploadActiveSpeakerTimeline(
+          currentBotConfig.speakerTimelineUploadUrl,
+          currentBotConfig.token,
+          currentBotConfig.meeting_id,
+          currentBotConfig.connectionId || "",
+        );
+      } else {
+        log("[Graceful Leave] No active-speaker samples to upload.");
+      }
+    }
+  } catch (tlErr: any) {
+    log(`[Graceful Leave] Speaker-timeline upload skipped: ${tlErr?.message}`);
   }
 
   // Sync browser data back to S3 for authenticated bots (preserves cookies/sessions)
@@ -1667,7 +1693,7 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
                 const lower = n.toLowerCase();
                 return !(lower.includes(selfLower) || selfLower.includes(lower));
               });
-            }, currentBotConfig?.botName || 'Vexa Bot');
+            }, currentBotConfig?.botName || 'munshot meetbot');
 
             if (state && speakerIndex < state.length) {
               const fallbackName = state[speakerIndex];
@@ -2615,17 +2641,13 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     log('[Bot] Transcription disabled, skipping per-speaker pipeline');
   }
 
-  // Call the appropriate platform handler
+  // Call the appropriate platform handler — Google Meet only.
   try {
     if (botConfig.platform === "google_meet") {
       await handleGoogleMeet(botConfig, page, performGracefulLeave);
-    } else if (botConfig.platform === "zoom") {
-      await handleZoom(botConfig, page, performGracefulLeave);
-    } else if (botConfig.platform === "teams") {
-      await handleMicrosoftTeams(botConfig, page, performGracefulLeave);
     } else {
-      log(`Unknown platform: ${botConfig.platform}`);
-      await performGracefulLeave(page, 1, "unknown_platform");
+      log(`Unsupported platform: ${botConfig.platform} (this deployment is Google Meet only)`);
+      await performGracefulLeave(page, 1, "unsupported_platform");
     }
   } catch (error: any) {
     log(`Error during platform handling: ${error.message}`);

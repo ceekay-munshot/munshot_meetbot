@@ -177,6 +177,70 @@ class TestUserEndpoints:
             app.dependency_overrides.clear()
 
     @pytest.mark.asyncio
+    async def test_create_user_applies_default_concurrency(self, monkeypatch):
+        """A new user created without max_concurrent_bots gets the configured
+        default (not 0/unlimited), so a fresh signup can't exhaust the host."""
+        monkeypatch.setenv("DEFAULT_MAX_CONCURRENT_BOTS", "3")
+        mock_db = make_mock_db(None)
+        first_result = MagicMock()
+        first_scalars = MagicMock()
+        first_scalars.first.return_value = None
+        first_result.scalars.return_value = first_scalars
+        mock_db.execute.return_value = first_result
+
+        def fake_refresh(obj):
+            obj.id = 99
+            obj.created_at = "2025-01-01T00:00:00"
+        mock_db.refresh = AsyncMock(side_effect=fake_refresh)
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[verify_admin_token] = noop_verify_admin
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/admin/users",
+                    json={"email": "fresh@example.com"},
+                )
+            assert resp.status_code in (200, 201), resp.text
+            added = mock_db.add.call_args[0][0]
+            assert added.max_concurrent_bots == 3
+            assert resp.json()["max_concurrent_bots"] == 3
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_create_user_respects_explicit_concurrency(self, monkeypatch):
+        """An explicit max_concurrent_bots overrides the env default."""
+        monkeypatch.setenv("DEFAULT_MAX_CONCURRENT_BOTS", "3")
+        mock_db = make_mock_db(None)
+        first_result = MagicMock()
+        first_scalars = MagicMock()
+        first_scalars.first.return_value = None
+        first_result.scalars.return_value = first_scalars
+        mock_db.execute.return_value = first_result
+
+        def fake_refresh(obj):
+            obj.id = 100
+            obj.created_at = "2025-01-01T00:00:00"
+        mock_db.refresh = AsyncMock(side_effect=fake_refresh)
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[verify_admin_token] = noop_verify_admin
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/admin/users",
+                    json={"email": "vip@example.com", "max_concurrent_bots": 9},
+                )
+            assert resp.status_code in (200, 201), resp.text
+            added = mock_db.add.call_args[0][0]
+            assert added.max_concurrent_bots == 9
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
     async def test_create_user_returns_200_for_existing(self):
         """POST /admin/users returns 200 when user already exists."""
         fake_user = make_fake_user()

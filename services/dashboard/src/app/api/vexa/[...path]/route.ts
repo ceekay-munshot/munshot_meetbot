@@ -17,15 +17,29 @@ async function proxyRequest(
       { status: 500 }
     );
   }
-  const MINIO_INTERNAL_ENDPOINT = (process.env.MINIO_INTERNAL_ENDPOINT || "").trim();
 
   // Get user's token from HTTP-only cookie (set during login)
   const cookieStore = await cookies();
   const userToken = cookieStore.get(getAuthCookieName())?.value;
 
-  // VEXA_API_KEY from env is used ONLY for the meetings list endpoint
-  // (pre-login browsing). All other endpoints require a user cookie.
-  const VEXA_API_KEY = userToken || process.env.VEXA_API_KEY || "";
+  // Multi-user mode: when VEXA_REQUIRE_AUTH is on, every request MUST carry the
+  // logged-in user's own token — there is no shared-key fallback. This is what
+  // enforces per-user transcript isolation in the hosted product: without it,
+  // an unauthenticated visitor would silently act as the single shared
+  // VEXA_API_KEY system user and see that account's data. When the flag is off
+  // (local/dev/single-tenant), behaviour is unchanged: fall back to the env key
+  // so all endpoints work without a user session.
+  const requireAuth = ["1", "true", "yes"].includes(
+    (process.env.VEXA_REQUIRE_AUTH || "").toLowerCase()
+  );
+  if (requireAuth && !userToken) {
+    return NextResponse.json(
+      { error: "Not authenticated", detail: "Please log in." },
+      { status: 401, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+  const fallbackKey = requireAuth ? "" : process.env.VEXA_API_KEY || "";
+  const VEXA_API_KEY = userToken || fallbackKey;
 
   const { path } = await params;
   const pathString = path.join("/");
@@ -89,7 +103,6 @@ async function proxyRequest(
   }
 
   const upstreamSearchParams = new URLSearchParams(request.nextUrl.searchParams);
-  const proxyMasterMedia = method === "GET" && upstreamSearchParams.get("proxy") === "1";
   upstreamSearchParams.delete("proxy");
   const searchParams = upstreamSearchParams.toString();
   const url = `${VEXA_API_URL}/${pathString}${searchParams ? `?${searchParams}` : ""}`;
@@ -128,91 +141,6 @@ async function proxyRequest(
     clearTimeout(timeoutId);
 
     const contentType = response.headers.get("content-type") || "";
-
-    if (proxyMasterMedia && response.ok && contentType.includes("application/json")) {
-      const data = (await response.json()) as {
-        url?: string;
-        download_url?: string;
-        raw_url?: string;
-        media_file_id?: number | string;
-        content_type?: string;
-      };
-
-      const match = pathString.match(/^recordings\/(\d+)\/master$/);
-      const recordingId = match?.[1] || "";
-      const mediaType = upstreamSearchParams.get("type") || "";
-      if (!recordingId || !/^(audio|video)$/.test(mediaType)) {
-        return NextResponse.json(
-          { error: "Invalid master media proxy request" },
-          { status: 502, headers: { "Cache-Control": "no-store" } }
-        );
-      }
-
-      const selectedUrl = data.url || data.download_url || "";
-      if (!selectedUrl) {
-        return NextResponse.json(
-          { error: `No canonical ${mediaType} playback URL for recording ${recordingId}` },
-          { status: 404, headers: { "Cache-Control": "no-store" } }
-        );
-      }
-
-      let mediaUrl: URL;
-      const mediaHeaders: HeadersInit = {};
-      if (selectedUrl.startsWith("/")) {
-        if (!selectedUrl.startsWith(`/recordings/${recordingId}/media/`)) {
-          return NextResponse.json(
-            { error: "Invalid canonical media URL returned by backend" },
-            { status: 502, headers: { "Cache-Control": "no-store" } }
-          );
-        }
-        mediaUrl = new URL(selectedUrl, `${VEXA_API_URL}/`);
-        if (VEXA_API_KEY) {
-          mediaHeaders["X-API-Key"] = VEXA_API_KEY;
-        }
-      } else {
-        mediaUrl = new URL(selectedUrl);
-        const isHostLocalUrl = ["localhost", "127.0.0.1", "[::1]"].includes(mediaUrl.hostname);
-        if (isHostLocalUrl && (data.raw_url || data.media_file_id)) {
-          const rawUrl = data.raw_url || `/recordings/${recordingId}/media/${data.media_file_id}/raw`;
-          mediaUrl = new URL(rawUrl, `${VEXA_API_URL}/`);
-          if (VEXA_API_KEY) {
-            mediaHeaders["X-API-Key"] = VEXA_API_KEY;
-          }
-        } else if (isHostLocalUrl && MINIO_INTERNAL_ENDPOINT) {
-          return NextResponse.json(
-            { error: "Host-local presigned media URL is not proxy-safe; backend raw_url missing" },
-            { status: 502, headers: { "Cache-Control": "no-store" } }
-          );
-        }
-      }
-
-      if (rangeHeader) {
-        mediaHeaders["Range"] = rangeHeader;
-      }
-      const mediaResponse = await fetch(mediaUrl, {
-        headers: mediaHeaders,
-        cache: "no-store",
-      });
-      const mediaBlob = await mediaResponse.blob();
-      const mediaContentType =
-        mediaResponse.headers.get("content-type") ||
-        data.content_type ||
-        "application/octet-stream";
-      return new NextResponse(mediaBlob, {
-        status: mediaResponse.status,
-        headers: {
-          "Content-Type": mediaContentType,
-          "Content-Length": mediaResponse.headers.get("content-length") || "",
-          "Cache-Control": "no-store",
-          ...(mediaResponse.headers.get("content-range") && {
-            "Content-Range": mediaResponse.headers.get("content-range")!,
-          }),
-          ...(mediaResponse.headers.get("accept-ranges") && {
-            "Accept-Ranges": mediaResponse.headers.get("accept-ranges")!,
-          }),
-        },
-      });
-    }
 
     if (contentType.includes("audio") || contentType.includes("video") || contentType.includes("octet-stream")) {
       const mediaHeaders = new Headers({ "Cache-Control": "no-store" });

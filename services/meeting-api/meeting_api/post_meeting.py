@@ -271,91 +271,6 @@ async def fire_post_meeting_hooks(meeting: Meeting, db: AsyncSession) -> None:
         )
 
 
-async def finalize_in_progress_recordings(meeting: Meeting, db: AsyncSession) -> int:
-    """Mark all IN_PROGRESS recordings as COMPLETED + flip media_files[*].is_final=true.
-
-    v0.10.5 (post-prod-telemetry 2026-04-30) — Bug B: pre-fix, recordings whose
-    finalizer chunk never reached the server (bot was killed before it could send
-    the empty-body is_final=true chunk) stayed IN_PROGRESS forever, with all
-    media_files entries showing is_final=false. Consumers polling for is_final
-    couldn't tell when the recording is truly done.
-
-    Now: at post-meeting time (after meeting is in terminal state), any rec
-    payload still IN_PROGRESS gets flipped to COMPLETED, and every media_files
-    entry's is_final flag flipped to true. The actual chunk files in MinIO are
-    already there; this is purely the metadata reconciliation.
-
-    Returns count of recordings that were finalized here (0 if everything was
-    already finalized via the canonical chunk-finalizer path).
-    """
-    from sqlalchemy.orm import attributes
-    from .schemas import RecordingStatus
-    from datetime import datetime as _dt
-
-    if not meeting or not meeting.data:
-        return 0
-    recordings_list = list((meeting.data or {}).get("recordings") or [])
-    if not recordings_list:
-        return 0
-
-    finalized_count = 0
-    changed = False
-    for idx, rec in enumerate(recordings_list):
-        if not isinstance(rec, dict):
-            continue
-        # Only finalize recordings that haven't been completed via the
-        # canonical chunk-finalizer path. Already-completed recordings stay
-        # untouched.
-        if rec.get("status") == RecordingStatus.COMPLETED.value:
-            continue
-        rec_payload = dict(rec)
-        rec_payload["status"] = RecordingStatus.COMPLETED.value
-        rec_payload["completed_at"] = rec_payload.get("completed_at") or _dt.utcnow().isoformat()
-        # Flip is_final on every media_files entry so consumers see the
-        # recording as done.
-        media_files = list(rec_payload.get("media_files") or [])
-        any_changed = False
-        for mf in media_files:
-            if not isinstance(mf, dict):
-                continue
-            # #311 — Single-writer policy for master_path.
-            # If recording_finalizer has already written a master path on
-            # this media_files entry, treat it as the canonical owner and
-            # only observe — do NOT overwrite is_final / finalized_at /
-            # finalized_by. The race window: recording_finalizer uploads
-            # the master to storage and updates JSONB storage_path; if
-            # post_meeting fires between those two writes (or right after
-            # storage_path lands but before is_final flips), the
-            # pre-#311 code would stomp finalized_by="post_meeting_reconciler"
-            # over recording_finalizer's mark. Now: presence of a master
-            # storage_path is the signal that recording_finalizer owns
-            # this entry; we observe and skip.
-            sp = (mf.get("storage_path") or "")
-            if sp.endswith("/audio/master.webm") or sp.endswith("/audio/master.wav"):
-                # Observed: recording_finalizer is in flight or done. Don't write.
-                continue
-            if not mf.get("is_final"):
-                mf["is_final"] = True
-                mf["finalized_at"] = _dt.utcnow().isoformat()
-                mf["finalized_by"] = "post_meeting_reconciler"
-                any_changed = True
-        rec_payload["media_files"] = media_files
-        recordings_list[idx] = rec_payload
-        finalized_count += 1
-        changed = changed or any_changed or True
-
-    if changed:
-        meeting_data_dict = dict(meeting.data or {})
-        meeting_data_dict["recordings"] = recordings_list
-        meeting.data = meeting_data_dict
-        attributes.flag_modified(meeting, "data")
-        logger.info(
-            "[Bug-B-Fix] post_meeting_reconciler finalized recordings for meeting %s: count=%s",
-            meeting.id, finalized_count,
-        )
-    return finalized_count
-
-
 async def run_all_tasks(meeting_id: int):
     """Run all post-meeting tasks for a given meeting_id.
 
@@ -363,18 +278,17 @@ async def run_all_tasks(meeting_id: int):
     """
     logger.info(f"Starting post-meeting tasks for meeting {meeting_id}")
 
-    # Task 0 (v0.10.5 Bug B fix): finalize any IN_PROGRESS recordings whose
-    # finalizer chunk never made it. Runs FIRST so downstream tasks (webhook
-    # delivery, hooks) see the canonical "completed" state.
-    try:
-        async with async_session_local() as db:
-            meeting = await db.get(Meeting, meeting_id)
-            if meeting:
-                count = await finalize_in_progress_recordings(meeting, db)
-                if count > 0:
-                    await db.commit()
-    except Exception as e:
-        logger.error(f"Recording finalization failed for meeting {meeting_id}: {e}", exc_info=True)
+    # Task 0: Batch transcription — transcribe the WHOLE recorded meeting once
+    # (Deepgram nova-3 'multi' + diarization) and replace any realtime rows.
+    # Runs before aggregation so participants/languages aggregate from the
+    # high-quality batch transcript. Best-effort: a failure leaves realtime rows
+    # (if any) intact and never blocks the rest of the post-meeting pipeline.
+    if os.getenv("BATCH_TRANSCRIBE_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+        try:
+            from .batch_transcribe import batch_transcribe_meeting
+            await batch_transcribe_meeting(meeting_id)
+        except Exception as e:
+            logger.error(f"Batch transcription failed for meeting {meeting_id}: {e}", exc_info=True)
 
     # Task 1: Aggregate transcription data (makes HTTP call to collector)
     try:

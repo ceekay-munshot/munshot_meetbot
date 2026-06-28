@@ -14,6 +14,7 @@ Syncs Google Calendar events and automatically schedules meeting bots to join up
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/calendar/oauth` (`/public/join`) | Store Google refresh token from Cloudflare Worker |
 | `POST` | `/calendar/connect` | Trigger initial sync after OAuth connection |
 | `GET` | `/calendar/status` | Check if a user has a calendar connected |
 | `GET` | `/calendar/events` | List upcoming calendar events for a user |
@@ -37,6 +38,7 @@ All endpoints accept `user_id` as a query parameter.
 |----------|---------|-------------|
 | `LOG_LEVEL` | `INFO` | Log level |
 | `SYNC_INTERVAL_SECONDS` | `300` | Seconds between calendar sync cycles |
+| `CALENDAR_ALLOW_INSECURE_OAUTH` | `false` | Skip `X-API-Key` check on `/calendar/oauth` (dev only) |
 | `DATABASE_URL` | — | PostgreSQL connection string (via admin-models/meeting-api) |
 
 ### Run

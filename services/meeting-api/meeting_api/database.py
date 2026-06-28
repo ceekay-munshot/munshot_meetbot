@@ -94,6 +94,11 @@ async def init_db():
     logger.info(f"Initializing database tables at {DB_HOST}:{DB_PORT}/{DB_NAME}")
     try:
         await ensure_schema(engine, Base, prerequisites=AdminBase)
+        # Audio-recording feature removed: drop the now-orphaned tables if a
+        # previous deployment created them. Idempotent — no-op on fresh DBs.
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS media_files CASCADE;"))
+            await conn.execute(text("DROP TABLE IF EXISTS recordings CASCADE;"))
         logger.info("Database tables checked/created successfully.")
     except Exception as e:
         logger.error(f"Error initializing database tables: {e}", exc_info=True)

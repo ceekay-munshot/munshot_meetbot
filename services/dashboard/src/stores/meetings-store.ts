@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Meeting, TranscriptSegment, Platform, MeetingStatus, RecordingData, ChatMessage } from "@/types/vexa";
+import type { Meeting, TranscriptSegment, Platform, MeetingStatus, ChatMessage } from "@/types/vexa";
 import { VexaAPIError, vexaAPI } from "@/lib/api";
 import {
   type TranscriptManager,
@@ -20,46 +20,11 @@ function isHiddenDeletedMeeting(meeting: Meeting): boolean {
   return redacted || missingNativeId;
 }
 
-function recordingsFromMeeting(meeting: Meeting | null): RecordingData[] {
-  const recordings = meeting?.data?.recordings;
-  return Array.isArray(recordings) ? (recordings as RecordingData[]) : [];
-}
-
-export function recordingsStateSignature(meeting: Meeting | null): string {
-  return recordingsFromMeeting(meeting)
-    .map((recording) => {
-      const mediaFiles = Array.isArray(recording.media_files)
-        ? recording.media_files
-            .map((media) => [
-              media.id,
-              media.type,
-              media.format,
-              media.is_final === true ? "final" : "partial",
-              media.finalized_by ?? "",
-              media.storage_path ?? "",
-              media.file_size_bytes ?? "",
-              media.duration_seconds ?? "",
-            ].join(":"))
-            .join(",")
-        : "";
-      return [
-        recording.id,
-        recording.status,
-        recording.completed_at ?? "",
-        recording.playback_url?.audio ?? "",
-        recording.playback_url?.video ?? "",
-        mediaFiles,
-      ].join(";");
-    })
-    .join("|");
-}
-
 interface MeetingsState {
   // Data
   meetings: Meeting[];
   currentMeeting: Meeting | null;
   transcripts: TranscriptSegment[];
-  recordings: RecordingData[];
   chatMessages: ChatMessage[];
 
   // Internal state for best-known-transcript model
@@ -124,7 +89,6 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
   meetings: [],
   currentMeeting: null,
   transcripts: [],
-  recordings: [],
   chatMessages: [],
   _manager: createTranscriptManager(),
   hasMore: false,
@@ -236,7 +200,6 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
       set({
         currentMeeting: meeting,
         meetings: updatedMeetings,
-        recordings: recordingsFromMeeting(meeting),
         isLoadingMeeting: false,
       });
     } catch (error) {
@@ -257,11 +220,8 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
       const meeting = await vexaAPI.getMeeting(id);
       if (meeting) {
         const { currentMeeting, meetings } = get();
-        const currentRecordingSignature = recordingsStateSignature(currentMeeting);
-        const nextRecordingSignature = recordingsStateSignature(meeting);
         if (currentMeeting?.status !== meeting.status ||
-            currentMeeting?.updated_at !== meeting.updated_at ||
-            currentRecordingSignature !== nextRecordingSignature) {
+            currentMeeting?.updated_at !== meeting.updated_at) {
           // Update in meetings list if present
           const updatedMeetings = meetings.map((m) =>
             m.id.toString() === id ? meeting : m
@@ -269,7 +229,6 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
           set({
             meetings: updatedMeetings,
             currentMeeting: meeting,
-            recordings: recordingsFromMeeting(meeting),
           });
         }
       }
@@ -292,9 +251,6 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
       // - sort by absolute_start_time
       // - collapse overlap (containment / expansion / tail-repeat)
       get().bootstrapTranscripts(result.segments);
-      // Store the authoritative recording list, including empty responses so
-      // navigating between meetings cannot leave stale playback controls behind.
-      set({ recordings: result.recordings });
       if (!silent) {
         set({ isLoadingTranscripts: false });
       }
@@ -325,7 +281,6 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
       if (currentMeeting?.platform_specific_id === nativeId) {
         set({
           currentMeeting: updatedMeeting,
-          recordings: recordingsFromMeeting(updatedMeeting),
         });
       }
 
@@ -359,17 +314,17 @@ export const useMeetingsStore = create<MeetingsState>((set, get) => ({
 
     set({
       meetings: updatedMeetings,
-      ...(shouldClearCurrent ? { currentMeeting: null, transcripts: [], recordings: [], chatMessages: [], _manager: createTranscriptManager() } : {}),
+      ...(shouldClearCurrent ? { currentMeeting: null, transcripts: [], chatMessages: [], _manager: createTranscriptManager() } : {}),
     });
   },
 
   setCurrentMeeting: (meeting: Meeting | null) => {
-    set({ currentMeeting: meeting, recordings: recordingsFromMeeting(meeting) });
+    set({ currentMeeting: meeting });
   },
 
   clearCurrentMeeting: () => {
     set({
-      currentMeeting: null, transcripts: [], recordings: [], chatMessages: [],
+      currentMeeting: null, transcripts: [], chatMessages: [],
       _manager: createTranscriptManager(),
     });
   },

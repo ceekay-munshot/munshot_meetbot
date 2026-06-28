@@ -5,6 +5,7 @@ import { RecordingService } from "../../services/recording";
 import { getSegmentPublisher } from "../../index";
 import { ensureBrowserUtils } from "../../utils/injection";
 import { MediaRecorderCapture, UnifiedRecordingPipeline } from "../../services/audio-pipeline";
+import { startActiveSpeakerSampler } from "../../services/active-speaker-timeline";
 import {
   googleParticipantSelectors,
   googleSpeakingClassNames,
@@ -159,6 +160,12 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
       });
       await pipeline.start();
       log("[Google Recording] Unified recording pipeline started (MediaRecorder → chunked upload)");
+
+      // Start the active-speaker sampler aligned with recording t=0 so the
+      // post-meeting batch job can map Deepgram diarization indices to names.
+      if (botConfig.speakerTimelineUploadUrl) {
+        startActiveSpeakerSampler(page, botConfig.botName);
+      }
     }
   } else {
     log("[Google Recording] Audio capture disabled by config.");

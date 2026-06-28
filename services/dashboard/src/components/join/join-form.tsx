@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useMemo, useEffect, useRef } from "react";
-import { Video, Loader2, Check, AlertCircle, Sparkles, Mic, UserCheck } from "lucide-react";
+import { Video, Loader2, Check, AlertCircle, Sparkles, UserCheck } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -58,7 +58,6 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
     }
   }, [config?.defaultBotName]);
   const [language, setLanguage] = useState("auto");
-  const [transcribeEnabled, setTranscribeEnabled] = useState(true);
   const [authenticated, setAuthenticated] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [touched, setTouched] = useState<Record<string, boolean>>({});
@@ -120,7 +119,7 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
     }
 
     // Set bot name - use custom name or configured default
-    request.bot_name = botName.trim() || config?.defaultBotName || "Munshot Notetaker";
+    request.bot_name = botName.trim() || config?.defaultBotName || "munshot meetbot";
 
     // Persist to localStorage
     if (typeof window !== "undefined") {
@@ -129,10 +128,6 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
 
     if (language && language !== "auto") {
       request.language = language;
-    }
-
-    if (!transcribeEnabled) {
-      request.transcribe_enabled = false;
     }
 
     if (authenticated) {
@@ -427,26 +422,6 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
             </p>
           </div>
 
-          {/* Transcription Toggle */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label htmlFor="transcribeEnabled" className="flex items-center gap-2 cursor-pointer">
-                <Mic className="h-3.5 w-3.5" />
-                Real-time Transcription
-              </Label>
-              <Switch
-                id="transcribeEnabled"
-                checked={transcribeEnabled}
-                onCheckedChange={setTranscribeEnabled}
-              />
-            </div>
-            {!transcribeEnabled && (
-              <p className="text-xs text-muted-foreground">
-                Bot will record audio only. You can transcribe later from the meeting page.
-              </p>
-            )}
-          </div>
-
           {/* Authenticated Toggle — coming soon */}
           <div className="space-y-2">
             <div className="flex items-center justify-between opacity-50">
@@ -464,7 +439,6 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
           </div>
 
           {/* Language */}
-          {transcribeEnabled && (
           <div className="space-y-2">
             <Label htmlFor="language">Transcription Language</Label>
             <LanguagePicker
@@ -478,7 +452,6 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
               </p>
             )}
           </div>
-          )}
 
           {/* Submit */}
           <div className="flex items-center">
@@ -499,7 +472,7 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
               ) : (
                 <>
                   <Sparkles className="mr-2 h-4 w-4" />
-                  {transcribeEnabled ? "Start Transcription" : "Start Recording"}
+                  Start Transcription
                 </>
               )}
             </Button>
@@ -508,9 +481,7 @@ export function JoinForm({ onSuccess }: JoinFormProps) {
 
           {/* Helpful tip */}
           <p className="text-xs text-center text-muted-foreground">
-            {transcribeEnabled
-              ? "The bot will join your meeting and transcribe in real-time"
-              : "The bot will join your meeting and record audio only"}
+            The bot will join your meeting and transcribe in real-time
           </p>
         </form>
       </CardContent>
