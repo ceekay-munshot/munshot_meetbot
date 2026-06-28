@@ -34,6 +34,7 @@ from .meetings import (
 )
 from .post_meeting import run_all_tasks
 from .collector.auth import require_internal_secret
+from .collector.d1_meeting_forwarder import safe_mirror_meeting as _d1_safe_mirror_meeting
 
 logger = logging.getLogger("meeting_api.callbacks")
 
@@ -498,6 +499,10 @@ async def bot_exit_callback(
                 reason=payload.reason, transition_source="bot_callback",
             )
 
+        # Best-effort D1 meeting mirror — captures terminal status,
+        # completion_reason, failure_stage, end_time. Non-fatal.
+        background_tasks.add_task(_d1_safe_mirror_meeting, meeting)
+
         background_tasks.add_task(run_all_tasks, meeting.id)
 
         return {"status": "callback processed", "meeting_id": meeting.id, "final_status": meeting.status}
@@ -560,6 +565,7 @@ async def bot_startup_callback(
             old_status=old_status, new_status=MeetingStatus.ACTIVE.value,
             transition_source="bot_callback",
         )
+        background_tasks.add_task(_d1_safe_mirror_meeting, meeting)
 
     return {"status": "startup processed", "meeting_id": meeting.id, "meeting_status": meeting.status}
 
@@ -587,6 +593,7 @@ async def bot_joining_callback(
             old_status=old_status, new_status=MeetingStatus.JOINING.value,
             transition_source="bot_callback",
         )
+        background_tasks.add_task(_d1_safe_mirror_meeting, meeting)
 
     return {"status": "joining processed", "meeting_id": meeting.id, "meeting_status": meeting.status}
 
@@ -614,6 +621,7 @@ async def bot_awaiting_admission_callback(
             old_status=old_status, new_status=MeetingStatus.AWAITING_ADMISSION.value,
             transition_source="bot_callback",
         )
+        background_tasks.add_task(_d1_safe_mirror_meeting, meeting)
 
     return {"status": "awaiting_admission processed", "meeting_id": meeting.id, "meeting_status": meeting.status}
 
@@ -929,6 +937,10 @@ async def bot_status_change_callback(
             reason=reason,
             transition_source="bot_callback",
         )
+        # Best-effort D1 meeting mirror — captures new status, terminal
+        # classification (completion_reason / failure_stage), timestamps.
+        # Non-fatal.
+        background_tasks.add_task(_d1_safe_mirror_meeting, meeting)
 
     return {"status": "processed", "meeting_id": meeting.id, "meeting_status": meeting.status}
 

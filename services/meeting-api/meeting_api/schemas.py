@@ -554,6 +554,24 @@ class MeetingCreate(BaseModel):
     workspaceGitToken: Optional[str] = Field(None, description="Git token for workspace repo access")
     workspaceGitBranch: Optional[str] = Field(None, description="Git branch for workspace (default: main)")
 
+    # Per-meeting webhook config. When provided, overrides the user's default
+    # webhook config (PUT /user/webhook) for THIS meeting only. Intended for
+    # the Cloudflare Worker / BFF deployment shape where webhook target lives
+    # at the edge, not in the user record. The handler validates webhook_url
+    # against the SSRF-safe validator (meeting_api.webhook_url).
+    webhook_url: Optional[str] = Field(
+        None,
+        description="Per-meeting webhook URL override. Receives the same envelopes as the user-level webhook. Validated SSRF-safe.",
+    )
+    webhook_secret: Optional[str] = Field(
+        None,
+        description="Per-meeting webhook signing secret. Used to compute X-Webhook-Signature (HMAC-SHA256 over `{timestamp}.{rawBody}`) and Authorization: Bearer.",
+    )
+    webhook_events: Optional[Dict[str, bool]] = Field(
+        None,
+        description="Per-meeting webhook event mask, e.g. {'meeting.completed': true, 'bot.failed': true}. Events with value false are skipped for this meeting.",
+    )
+
     # v0.10.5 Pack X — synthetic-test dry-run flag.
     # When dry_run=True, meeting record is created but NO bot is launched
     # via runtime-api. Test driver controls full lifecycle via

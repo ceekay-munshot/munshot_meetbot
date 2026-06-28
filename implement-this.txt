@@ -1,0 +1,422 @@
+Implement this in this repo.
+
+Goal
+
+Support this deployment shape cleanly:
+
+- Cloudflare Pages app is the user-facing frontend.
+- A Cloudflare Worker acts as the public BFF/API edge.
+- This repo's AWS-hosted Vexa stack remains the execution system of record for bots, live transcripts, meeting state, recordings, and bot lifecycle.
+- Cloudflare D1 stores a mirrored copy of finalized transcript data, plus enough meeting metadata/events for Cloudflare-side reads if needed.
+
+Important architectural decision
+
+- Do NOT turn D1 into the live source of truth for active meetings.
+- Keep live UX backed by this repo's existing AWS stack:
+  - create/join bot via REST
+  - bootstrap transcript via REST
+  - live updates via WebSocket
+  - recordings via existing recording endpoints
+- Use D1 as a mirror/read-model/archive/search surface.
+
+What already exists in this repo and should be reused
+
+1. Bot launch and meeting management
+- Public gateway route: `POST /bots`
+- Gateway file: `services/api-gateway/main.py`
+- Downstream handler: `services/meeting-api/meeting_api/meetings.py`
+- Request schema: `services/meeting-api/meeting_api/schemas.py` -> `MeetingCreate`
+
+2. Meeting reads
+- `GET /meetings`
+- `GET /meetings/{id}`
+- Transcript read: `GET /transcripts/{platform}/{native_meeting_id}`
+- Collector endpoints file: `services/meeting-api/meeting_api/collector/endpoints.py`
+
+3. Live transcript/status/chat WebSocket
+- `WS /ws`
+- Gateway file: `services/api-gateway/main.py`
+- Subscription payload is:
+  - `{ "action": "subscribe", "meetings": [{ "platform": "google_meet", "native_id": "abc-defg-hij" }] }`
+- Current WS fan-in channels are meeting-id based and already carry mutable transcript/status/chat messages.
+
+4. Deferred transcription
+- `POST /meetings/{meeting_id}/transcribe`
+
+5. Recordings
+- `GET /recordings`
+- `GET /recordings/{recording_id}`
+- `GET /recordings/{recording_id}/master?type=audio|video`
+- `GET /recordings/{recording_id}/media/{media_file_id}/download`
+- `GET /recordings/{recording_id}/media/{media_file_id}/raw`
+- `DELETE /recordings/{recording_id}`
+
+6. Cloudflare D1 transcript mirror already exists
+- Forwarder: `services/meeting-api/meeting_api/collector/d1_forwarder.py`
+- Hook point: `services/meeting-api/meeting_api/collector/db_writer.py`
+- Config: `services/meeting-api/meeting_api/collector/config.py`
+- Schema: `deploy/cloudflare-d1/schema.sql`
+- Setup doc: `deploy/cloudflare-d1/README.md`
+
+Current D1 mirror behavior
+
+- After finalized transcript segments are committed to Postgres, they are best-effort mirrored to Cloudflare D1.
+- D1 table currently stores only transcript rows:
+  - `meeting_id`
+  - `segment_id`
+  - `start_time`
+  - `end_time`
+  - `text`
+  - `speaker`
+  - `language`
+  - `session_uid`
+  - `created_at`
+- This is idempotent on `(meeting_id, segment_id)`.
+
+What is missing and must be implemented in this repo
+
+Part A. Expose a Cloudflare-friendly integration path without weakening security
+
+Problem
+
+- The current public gateway strips client-supplied identity/webhook headers in `forward_request()`.
+- It only injects webhook settings from resolved token/user data.
+- That means a Cloudflare Worker cannot currently register per-meeting webhook config by simply forwarding custom headers on `POST /bots`.
+
+Required implementation
+
+1. Add first-class per-request webhook fields to the public create-bot API.
+
+Add optional fields to the `MeetingCreate` request model, something like:
+
+- `webhook_url?: string`
+- `webhook_secret?: string`
+- `webhook_events?: { [eventType: string]: boolean }`
+
+Do not rely on ad hoc headers from Cloudflare for this path.
+
+2. Thread those fields through the public path:
+
+- `services/meeting-api/meeting_api/schemas.py`
+- `services/api-gateway/main.py`
+- `services/meeting-api/meeting_api/meetings.py`
+
+3. Merge behavior carefully in `POST /bots`:
+
+- If webhook config is supplied in the request body, use it for that meeting.
+- Otherwise fall back to the current user/token-derived webhook config.
+- Validate `webhook_url` with the existing SSRF-safe validator already used elsewhere.
+- Preserve existing behavior for clients that send no webhook config.
+
+4. Document this new request surface in code comments and docs.
+
+Important
+
+- Do not remove existing `PUT /user/webhook` support.
+- Keep both modes:
+  - user-level default webhook config
+  - per-meeting override on create-bot
+
+Part B. Mirror meeting metadata/events into D1, not just transcript segments
+
+Problem
+
+- Current D1 mirror only stores finalized transcript rows.
+- Cloudflare-side dashboard reads will also need meeting-level information without calling AWS for every non-live page.
+- At minimum Cloudflare needs enough state to answer:
+  - what meetings exist for a user
+  - what their status is
+  - basic metadata
+  - whether transcript/recording data exists
+  - terminal outcome timestamps
+
+Required implementation
+
+Add a second best-effort D1 sink for meeting metadata. Keep AWS Postgres authoritative.
+
+Create a new D1 schema file, likely adjacent to the existing one, for a `meetings` mirror table. Suggested columns:
+
+- `meeting_id INTEGER PRIMARY KEY`
+- `user_id INTEGER NOT NULL`
+- `platform TEXT NOT NULL`
+- `native_meeting_id TEXT NOT NULL`
+- `status TEXT NOT NULL`
+- `bot_name TEXT`
+- `language TEXT`
+- `transcribe_enabled INTEGER`
+- `recording_enabled INTEGER`
+- `has_recordings INTEGER`
+- `segment_count INTEGER`
+- `started_at TEXT`
+- `ended_at TEXT`
+- `created_at TEXT`
+- `updated_at TEXT`
+- `completion_reason TEXT`
+- `failure_stage TEXT`
+- `webhook_url TEXT` only if absolutely needed; otherwise do not mirror secrets or webhook config
+- `data_json TEXT` only if necessary; prefer typed columns over dumping everything
+
+Do NOT mirror secrets into D1.
+
+Implement a best-effort forwarder similar to the transcript forwarder. It should upsert by `meeting_id`.
+
+Hook it into lifecycle moments where meeting state materially changes:
+
+- after meeting row creation in `POST /bots`
+- on bot status changes/callbacks
+- after post-meeting aggregation/finalization
+- after deferred transcription completes
+- when recordings are finalized if `has_recordings` or recording metadata should update
+
+Suggested implementation files
+
+- new file: `services/meeting-api/meeting_api/collector/d1_meeting_forwarder.py` or similar
+- touch:
+  - `services/meeting-api/meeting_api/meetings.py`
+  - `services/meeting-api/meeting_api/callbacks.py`
+  - `services/meeting-api/meeting_api/post_meeting.py`
+  - `services/meeting-api/meeting_api/recordings.py`
+
+Part C. Mirror recording metadata into D1 if Cloudflare-side dashboard needs it
+
+Problem
+
+- Current D1 mirror does not contain recording rows or media metadata.
+- If the Cloudflare side needs to list/download recordings without AWS round-trips, it needs a mirror of recording metadata.
+
+Required implementation
+
+Pick one of these approaches and implement it explicitly:
+
+Option 1: Minimal and recommended
+- Store only summary flags on the D1 `meetings` table:
+  - `has_recordings`
+  - maybe `recording_count`
+  - maybe `recording_status`
+- Cloudflare still calls AWS for actual recording detail/download URLs.
+
+Option 2: Full mirror
+- Add D1 tables for `recordings` and `recording_media_files`
+- Mirror enough metadata to render a recording list in Cloudflare
+- Still do not mirror presigned URLs; those must be fetched from AWS on demand
+
+Recommended default
+
+- Implement Option 1 unless there is a hard requirement for Cloudflare-only recording list pages.
+
+Part D. Add explicit docs for the Cloudflare Worker/BFF integration contract
+
+Add a repo doc that tells external implementers exactly how to integrate Cloudflare with this repo.
+
+Create something like:
+
+- `docs/cloudflare-worker-integration.md`
+
+Document:
+
+1. Cloudflare Worker -> AWS REST calls
+- `POST /bots`
+- `GET /meetings`
+- `GET /meetings/{id}`
+- `GET /transcripts/{platform}/{native_meeting_id}`
+- `POST /meetings/{meeting_id}/transcribe`
+- `/recordings/*`
+
+2. Cloudflare Worker -> AWS WebSocket contract
+- connect to `wss://.../ws?api_key=...`
+- subscribe payload shape
+- expected message classes:
+  - `transcript.mutable`
+  - `transcript.finalized`
+  - `meeting.status`
+  - `subscribed`
+  - `pong`
+  - `error`
+
+3. Webhook contract back into Cloudflare
+- event envelope shape from `build_envelope()`:
+  - `event_id`
+  - `event_type`
+  - `api_version`
+  - `created_at`
+  - `data`
+- signature verification:
+  - `Authorization: Bearer <secret>` for backward compatibility
+  - `X-Webhook-Timestamp`
+  - `X-Webhook-Signature: sha256=<hex>` over `"{timestamp}.{rawBody}"`
+
+4. Event types Cloudflare should expect
+- `meeting.completed`
+- `meeting.started`
+- `bot.failed`
+- `meeting.status_change`
+- `recording.completed`
+
+5. Strong recommendation
+- Live UX should read AWS directly.
+- D1 should be treated as mirrored persistence, search, archive, or fallback read model.
+
+Part E. Add tests for the new behavior
+
+Add tests for all new public and mirror functionality.
+
+Minimum tests required
+
+1. Create-bot webhook override tests
+- request body webhook config is accepted
+- request body webhook config is validated
+- request body webhook config overrides token/user default for that meeting only
+- old clients without webhook fields still work
+
+2. D1 meeting mirror tests
+- meeting creation triggers upsert to D1 sink
+- status transition triggers update
+- deferred transcription updates segment count / transcript-ready state
+- sink failures are non-fatal and do not break primary flow
+
+3. D1 transcript mirror regression tests
+- existing transcript D1 mirroring remains intact
+- idempotent resend does not duplicate rows
+
+4. Security tests
+- secrets are not mirrored to D1 tables
+- malformed/unsafe webhook URLs are rejected
+- public gateway still strips spoofable identity headers
+
+Part F. Keep backward compatibility and avoid unnecessary redesign
+
+Rules
+
+- Do not redesign the whole auth stack.
+- Do not replace the current REST or WS transport.
+- Do not make Cloudflare mandatory for local/compose deployment.
+- Do not remove or break current dashboard behavior.
+- Do not move source of truth away from Postgres/Redis in AWS.
+- Do not mirror sensitive secrets into D1.
+
+Expected implementation details
+
+Public API request example for Cloudflare Worker
+
+`POST /bots`
+
+Example body:
+
+{
+  "meeting_url": "https://meet.google.com/abc-defg-hij",
+  "bot_name": "Acme Notetaker",
+  "language": "en",
+  "transcribe_enabled": true,
+  "webhook_url": "https://my-worker.example.com/webhooks/vexa",
+  "webhook_secret": "whsec_...",
+  "webhook_events": {
+    "meeting.started": true,
+    "meeting.completed": true,
+    "bot.failed": true,
+    "meeting.status_change": false,
+    "recording.completed": true
+  }
+}
+
+Expected behavior:
+
+- Bot launches as normal.
+- Meeting row is created in AWS Postgres.
+- Live transcript continues to flow over existing Redis -> collector -> WS path.
+- Finalized transcript segments continue to mirror to D1.
+- Meeting summary/state also mirrors to D1.
+- Webhooks can be delivered to Cloudflare Worker per meeting.
+
+Cloudflare-side usage model to support
+
+1. User clicks "join" on Cloudflare Pages.
+2. Worker calls this repo's `POST /bots`.
+3. Worker stores returned `meeting_id` and platform/native id mapping in its own app DB if desired.
+4. Cloudflare UI uses either:
+   - direct Worker proxy to AWS `GET /transcripts/...` + `WS /ws` for live view, or
+   - D1 for delayed/finalized read pages.
+5. Cloudflare Worker receives webhook events from this repo and updates D1/local app tables.
+
+Implementation boundaries
+
+Implement in this repo only the parts that belong here:
+
+- public API support for per-meeting webhook config
+- D1 meeting metadata mirror
+- optional recording summary mirror
+- tests
+- docs
+
+Do NOT try to implement the Cloudflare Worker itself inside this repo.
+Document its contract instead.
+
+Suggested concrete file changes
+
+- `services/meeting-api/meeting_api/schemas.py`
+  - add optional webhook fields to `MeetingCreate`
+
+- `services/meeting-api/meeting_api/meetings.py`
+  - accept request-body webhook config
+  - validate and store per-meeting webhook config in `meeting.data`
+  - trigger D1 meeting mirror on create
+
+- `services/api-gateway/main.py`
+  - ensure request body passes through unchanged for create-bot override fields
+  - keep identity-header stripping intact
+  - update docs/comments if needed
+
+- `services/meeting-api/meeting_api/callbacks.py`
+  - trigger D1 meeting mirror on material status changes
+
+- `services/meeting-api/meeting_api/post_meeting.py`
+  - trigger D1 meeting mirror after post-meeting aggregation/finalization
+
+- `services/meeting-api/meeting_api/recordings.py`
+  - update D1 meeting mirror when recordings finalize
+
+- `services/meeting-api/meeting_api/collector/`
+  - add new D1 meeting mirror forwarder
+
+- `deploy/cloudflare-d1/`
+  - add schema for meeting mirror tables
+  - update README with full Cloudflare integration notes
+
+- `docs/`
+  - add Cloudflare integration doc
+
+- tests under `services/meeting-api/tests/`
+  - add coverage for new public API fields and D1 mirror behavior
+
+Acceptance criteria
+
+1. A Cloudflare Worker can call `POST /bots` with webhook config in the JSON body.
+2. The resulting meeting stores that webhook config on the meeting, without requiring a prior `PUT /user/webhook`.
+3. Existing clients that omit webhook config continue to work unchanged.
+4. Finalized transcript segments still mirror to D1 exactly as before.
+5. Meeting summary/state now also mirrors to D1 in a best-effort, non-fatal way.
+6. No secrets are written to D1.
+7. Tests cover the new behavior.
+8. Docs clearly tell Cloudflare implementers which AWS endpoints to call and when to use D1 versus AWS directly.
+
+Nice-to-have, if time permits
+
+- Add a small helper function for "safe best-effort D1 upsert for meeting snapshot" so call sites stay minimal.
+- Add operator-facing env docs if extra D1 tables/config are introduced.
+- Add one end-to-end test that proves create-bot -> lifecycle update -> D1 meeting upsert path.
+
+Do not ship if any of these are true
+
+- D1 failures can break meeting creation or transcription persistence.
+- webhook secrets or API keys are mirrored to D1.
+- existing dashboard REST/WS flows regress.
+- the implementation requires Cloudflare components to exist in local dev.
+
+Summary for Claude Code
+
+Build the smallest correct change set that makes this repo Cloudflare-friendly:
+
+- add per-meeting webhook config to `POST /bots`
+- add D1 meeting-state mirroring next to the existing transcript mirroring
+- keep AWS as the live source of truth
+- document the external Cloudflare Worker contract
+- test all of it

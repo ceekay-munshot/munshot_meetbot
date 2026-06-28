@@ -18,6 +18,7 @@ from .webhook_delivery import deliver_with_result, build_envelope
 
 from .config import TRANSCRIPTION_COLLECTOR_URL, POST_MEETING_HOOKS
 from .webhooks import send_completion_webhook
+from .collector.d1_meeting_forwarder import safe_mirror_meeting as _d1_safe_mirror_meeting
 
 logger = logging.getLogger("meeting_api.post_meeting")
 
@@ -321,6 +322,17 @@ async def run_all_tasks(meeting_id: int):
                 await db.commit()
     except Exception as e:
         logger.error(f"Post-meeting hooks failed for meeting {meeting_id}: {e}", exc_info=True)
+
+    # Task 4: Best-effort D1 meetings mirror — final snapshot after
+    # aggregation has populated segment_count + terminal status. Captures
+    # the post-meeting state Cloudflare-side reads care about. Non-fatal.
+    try:
+        async with async_session_local() as db:
+            meeting = await db.get(Meeting, meeting_id)
+            if meeting:
+                await _d1_safe_mirror_meeting(meeting)
+    except Exception as e:
+        logger.error(f"D1 meeting mirror failed for meeting {meeting_id} (non-fatal): {e}", exc_info=True)
 
     logger.info(f"Post-meeting tasks completed for meeting {meeting_id}")
 
