@@ -183,3 +183,6 @@ tests3/.state-*
 # Local AI-tool artifacts (generated, large — not product code)
 graphify-out/
 .opencode/
+
+# bot default-avatar assets are required for the vexa-bot image build (override *.png above)
+!services/vexa-bot/core/assets/*.png

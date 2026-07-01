@@ -15,7 +15,7 @@ services:
       - redis-data:/data
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   postgres:
     image: postgres:17-alpine
@@ -37,7 +37,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   minio:
     image: minio/minio:latest
@@ -62,7 +62,7 @@ services:
       - minio-data:/data
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   minio-init:
     image: minio/mc:latest
@@ -116,7 +116,7 @@ services:
         condition: service_healthy
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   runtime-api:
     build:
@@ -161,7 +161,7 @@ services:
       - postgres
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   api-gateway:
     build:
@@ -171,6 +171,7 @@ services:
     mem_limit: 1g
     ports:
       - "${API_GATEWAY_HOST_PORT:-8056}:8000"
+      - "8080:8000"        # extra fixed port for Cloudflare-Worker reachability (Workers block 8056)
     environment:
       - ADMIN_API_URL=http://admin-api:8001
       - MEETING_API_URL=http://meeting-api:8080
@@ -204,7 +205,7 @@ services:
         condition: service_started
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   meeting-api:
     build:
@@ -282,7 +283,7 @@ services:
       - runtime-api
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   # --- Optional services ---
 
@@ -324,7 +325,7 @@ services:
       - meeting-api
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
   dashboard:
     build:
@@ -369,7 +370,7 @@ services:
       - api-gateway
     networks:
       - vexa
-    restart: "no"
+    restart: unless-stopped
 
 volumes:
   redis-data:

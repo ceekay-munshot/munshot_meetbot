@@ -55,6 +55,9 @@ COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --chown=nextjs:nodejs services/dashboard/docker-entrypoint.sh ./docker-entrypoint.sh
+# Ensure the entrypoint is executable regardless of the source file's git mode
+# (docker-entrypoint.sh is tracked 100644, so a clean clone loses the +x bit).
+RUN chmod +x ./docker-entrypoint.sh
 
 USER nextjs
 
