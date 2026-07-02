@@ -471,6 +471,18 @@ async def calendar_meetings_proxy(request: Request):
     url = f"{CALENDAR_SERVICE_URL}/calendar/meetings"
     return await forward_request(app.state.http_client, "GET", url, request, require_auth=False)
 
+
+@app.post("/calendar/meetings/remove", tags=["Calendar"], summary="Remove a client's scheduled meeting (server-to-server)")
+async def calendar_meetings_remove_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/meetings/remove"
+    return await forward_request(app.state.http_client, "POST", url, request, require_auth=False)
+
+
+@app.post("/calendar/meetings/restore", tags=["Calendar"], summary="Un-remove a client's scheduled meeting (server-to-server)")
+async def calendar_meetings_restore_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/meetings/restore"
+    return await forward_request(app.state.http_client, "POST", url, request, require_auth=False)
+
 # --- Bot Manager Routes --- 
 @app.post("/bots",
          tags=["Bot Management"],

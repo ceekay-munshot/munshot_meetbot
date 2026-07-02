@@ -6,18 +6,26 @@ import hmac
 import base64
 import hashlib
 import logging
+from datetime import datetime, timezone
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, or_, and_
 
 from meeting_api.database import get_db, init_db
 from meeting_api.models import CalendarEvent, Meeting
 from admin_models.models import User
-from app.sync import sync_user_calendar, schedule_upcoming_bots
+from app.sync import (
+    sync_user_calendar,
+    schedule_upcoming_bots,
+    _extract_native_id,
+    MEETING_API_URL,
+    BOT_API_TOKEN,
+)
 from app.google_calendar import (
     build_consent_url,
     exchange_code_for_tokens,
@@ -301,14 +309,17 @@ async def sync_client_calendar(
 @app.get("/calendar/meetings")
 async def list_client_meetings(
     email: str = Query(...),
+    include_cancelled: bool = Query(default=False),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: AsyncSession = Depends(get_db),
 ):
     """List every meeting for a client by email — calendar-scheduled and manual.
 
     Returns two arrays:
-      - calendar_events: upcoming/past events pulled from their Google Calendar
-        (status pending → scheduled once a bot is dispatched).
+      - calendar_events: upcoming events pulled from their Google Calendar
+        (status pending → scheduled once a bot is dispatched). Removed events
+        (status='cancelled') are excluded unless include_cancelled=true, which
+        lets the frontend build a "removed meetings" view to restore from.
       - meetings: actual bot meetings (Meeting rows). source='calendar' if the
         meeting was auto-dispatched from a calendar event, else 'manual'.
     """
@@ -319,8 +330,25 @@ async def list_client_meetings(
     if not user:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    # Only meetings that WILL happen (or are happening now) — the calendar sync
+    # writes future events but never prunes ones that have since passed, so we
+    # filter to not-yet-ended here. Prefer end_time; fall back to start_time
+    # when an event has no end.
+    now = datetime.now(timezone.utc)
+    conditions = [
+        CalendarEvent.user_id == user.id,
+        or_(
+            CalendarEvent.end_time >= now,
+            and_(CalendarEvent.end_time.is_(None), CalendarEvent.start_time >= now),
+        ),
+    ]
+    # Hide removed meetings by default; include them (with status='cancelled')
+    # only when the caller explicitly asks — e.g. to offer an "un-remove".
+    if not include_cancelled:
+        conditions.append(CalendarEvent.status != "cancelled")
+
     ev_result = await db.execute(
-        select(CalendarEvent).where(CalendarEvent.user_id == user.id).order_by(CalendarEvent.start_time)
+        select(CalendarEvent).where(*conditions).order_by(CalendarEvent.start_time)
     )
     events = ev_result.scalars().all()
 
@@ -361,6 +389,149 @@ async def list_client_meetings(
             }
             for m in meetings
         ],
+    }
+
+
+class CalendarMeetingRemoveRequest(BaseModel):
+    email: str
+    event_id: int
+
+
+@app.post("/calendar/meetings/remove")
+async def remove_client_meeting(
+    body: CalendarMeetingRemoveRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a scheduled/upcoming meeting for a client (server-to-server).
+
+    Identify the client by `email` and the meeting by `event_id` (the `id` from
+    GET /calendar/meetings' calendar_events array). The event is marked
+    'cancelled' so the bot won't auto-join. If a bot was already dispatched and
+    is still live, it's asked to leave.
+
+    We CANCEL rather than DELETE the row on purpose: the 5-min sync re-polls
+    Google and re-inserts events, so a hard delete would reappear as 'pending'
+    on the next poll and get re-joined. The sync upsert deliberately never
+    overwrites `status`, so 'cancelled' sticks. See app/sync.py.
+    """
+    _check_system_key(x_api_key)
+    email = (body.email or "").strip().lower()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    ev_result = await db.execute(
+        select(CalendarEvent).where(
+            CalendarEvent.id == body.event_id,
+            CalendarEvent.user_id == user.id,
+        )
+    )
+    event = ev_result.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=404, detail="Meeting not found for this client")
+
+    previous_status = event.status
+
+    # If a bot was already dispatched for this event, ask it to leave. Best-effort:
+    # a 404/already-stopped from meeting-api is fine — we still cancel the event.
+    # Same trusted-identity contract the sync loop uses to LAUNCH bots (sync.py).
+    bot_stopped = False
+    if event.meeting_id and previous_status == "scheduled" and event.meeting_url and event.platform:
+        try:
+            native_id = _extract_native_id(event.meeting_url, event.platform)
+            headers = {
+                "X-User-ID": str(event.user_id),
+                "X-User-Scopes": "bot",
+                "X-User-Limits": str(getattr(user, "max_concurrent_bots", 1) or 1),
+            }
+            if BOT_API_TOKEN:
+                headers["X-API-Key"] = BOT_API_TOKEN
+            async with httpx.AsyncClient() as client:
+                resp = await client.request(
+                    "DELETE",
+                    f"{MEETING_API_URL}/bots/{event.platform}/{native_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+            bot_stopped = resp.status_code in (200, 202)
+            if not bot_stopped:
+                logger.warning(
+                    f"Stop-bot for event {event.id} returned {resp.status_code}: {resp.text}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to stop bot for event {event.id}: {e}")
+
+    await db.execute(
+        update(CalendarEvent).where(CalendarEvent.id == event.id).values(status="cancelled")
+    )
+    await db.commit()
+
+    return {
+        "status": "removed",
+        "event_id": event.id,
+        "previous_status": previous_status,
+        "bot_stopped": bot_stopped,
+    }
+
+
+class CalendarMeetingRestoreRequest(BaseModel):
+    email: str
+    event_id: int
+
+
+@app.post("/calendar/meetings/restore")
+async def restore_client_meeting(
+    body: CalendarMeetingRestoreRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Un-remove a previously removed meeting (server-to-server).
+
+    Flips a 'cancelled' event back to 'pending' so the scheduler will auto-join
+    it again when it comes within lead time. Find cancelled events to restore
+    via GET /calendar/meetings?include_cancelled=true.
+
+    No-op (not an error) if the event isn't currently cancelled — the response
+    reports its actual status so the caller can react.
+    """
+    _check_system_key(x_api_key)
+    email = (body.email or "").strip().lower()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    ev_result = await db.execute(
+        select(CalendarEvent).where(
+            CalendarEvent.id == body.event_id,
+            CalendarEvent.user_id == user.id,
+        )
+    )
+    event = ev_result.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=404, detail="Meeting not found for this client")
+
+    if event.status != "cancelled":
+        # Nothing to undo — report current state rather than silently flipping a
+        # live/scheduled meeting back to pending.
+        return {
+            "status": "noop",
+            "event_id": event.id,
+            "current_status": event.status,
+            "detail": "Meeting is not removed; nothing to restore.",
+        }
+
+    await db.execute(
+        update(CalendarEvent).where(CalendarEvent.id == event.id).values(status="pending")
+    )
+    await db.commit()
+
+    return {
+        "status": "restored",
+        "event_id": event.id,
+        "new_status": "pending",
     }
 
 

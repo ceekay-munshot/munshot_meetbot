@@ -1053,6 +1053,11 @@ async def request_bot(
     # These do not change auth/security behavior; they're metadata.
     if req.bot_name:
         meeting_data["bot_name"] = req.bot_name
+    if req.name and req.name.strip():
+        # Human-friendly meeting title. GET /bots surfaces this as `name`
+        # (falling back to data.title), so lists show it instead of the
+        # "Meeting <id>" fallback. Calendar auto-joins pass the event title here.
+        meeting_data["name"] = req.name.strip()
     if req.language:
         meeting_data["language"] = req.language
 

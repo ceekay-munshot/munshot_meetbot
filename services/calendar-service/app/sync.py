@@ -191,6 +191,9 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
                         "platform": event.platform,
                         "native_meeting_id": _extract_native_id(event.meeting_url, event.platform),
                         "bot_name": CALENDAR_BOT_NAME,
+                        # Carry the calendar event title into the meeting so lists
+                        # show e.g. "Frontend Meeting Munshot" instead of "Meeting <id>".
+                        "name": event.title or None,
                     },
                     headers=headers,
                     timeout=30,
