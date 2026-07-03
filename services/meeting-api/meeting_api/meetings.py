@@ -1111,7 +1111,7 @@ async def request_bot(
         "max_bot_time": 7200000,          # 2h
         "max_wait_for_admission": 900000, # 15 min
         "max_time_left_alone": 900000,    # 15 min
-        "no_one_joined_timeout": 120000,  # 2 min
+        "no_one_joined_timeout": 900000,  # 15 min — wait for stragglers before giving up
     }
 
     # Resolution order: per-request → user.data.bot_config → system defaults

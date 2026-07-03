@@ -158,14 +158,39 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
         token: botConfig.token,
         platform: "gmeet",
       });
-      await pipeline.start();
-      log("[Google Recording] Unified recording pipeline started (MediaRecorder → chunked upload)");
 
-      // Start the active-speaker sampler aligned with recording t=0 so the
-      // post-meeting batch job can map Deepgram diarization indices to names.
-      if (botConfig.speakerTimelineUploadUrl) {
-        startActiveSpeakerSampler(page, botConfig.botName);
-      }
+      // Presence-gated recording: do NOT start capturing until 2+ participants
+      // are in the meeting. The bot joins early and can sit alone for up to
+      // noOneJoinedTimeout (15 min); recording that silence would burn
+      // Deepgram batch-transcription minutes for nothing. Deferring the whole
+      // pipeline.start() (rather than dropping chunks) keeps the WebM valid —
+      // MediaRecorder simply starts fresh when people arrive, so chunk 0 still
+      // carries the container header and t=0 aligns to first real audio. The
+      // browser-side monitoring loop calls window.__vexaArmRecording() the
+      // moment tile count > 1. Idempotent (guarded by recordingArmed).
+      let recordingArmed = false;
+      const armRecording = async () => {
+        if (recordingArmed) return;
+        recordingArmed = true;
+        try {
+          await pipeline!.start();
+          log("[Google Recording] 2+ participants present — recording armed (MediaRecorder → chunked upload)");
+          // Start the active-speaker sampler aligned with recording t=0 so the
+          // post-meeting batch job can map Deepgram diarization indices to names.
+          if (botConfig.speakerTimelineUploadUrl) {
+            startActiveSpeakerSampler(page, botConfig.botName);
+          }
+        } catch (e: any) {
+          log(`[Google Recording] presence-gated arm/start failed: ${e?.message || e}`);
+          recordingArmed = false; // allow a later tick to retry
+        }
+      };
+      await page.exposeFunction("__vexaArmRecording", () => {
+        // Fire-and-forget from browser context; never let a rejection escape
+        // into the page.
+        armRecording().catch(() => {});
+      });
+      log("[Google Recording] Recording pipeline constructed; start deferred until 2+ participants present (token-saving)");
     }
   } else {
     log("[Google Recording] Audio capture disabled by config.");
@@ -611,6 +636,13 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             const checkInterval = setInterval(() => {
               // Check participant count using the comprehensive helper
               const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount ? (window as any).getGoogleMeetActiveParticipantsCount() : 0;
+
+              // Presence-gated recording: arm audio capture the moment a 2nd
+              // participant is present (count includes the bot's own tile, so
+              // >1 means at least one real human). Idempotent on the Node side.
+              if (currentParticipantCount > 1) {
+                (window as any).__vexaArmRecording?.();
+              }
 
               if (currentParticipantCount !== lastParticipantCount) {
                 (window as any).logBot(`Participant check: Found ${currentParticipantCount} unique participants from central list.`);
