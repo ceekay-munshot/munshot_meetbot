@@ -137,7 +137,7 @@ async def upsert_meeting_owners(
                 source=source,
             )
             .on_conflict_do_nothing(
-                constraint="uq_meeting_owner_meeting_user"
+                index_elements=[MeetingOwner.meeting_id, MeetingOwner.user_id]
             )
         )
         await db.execute(stmt)

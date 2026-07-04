@@ -152,8 +152,12 @@ class MeetingOwner(Base):
     source = Column(String(50), nullable=False, server_default='calendar', default='calendar')
     created_at = Column(DateTime, server_default=func.now())
 
-    # email already carries index=True (-> ix_meeting_owners_email); no explicit
-    # duplicate here, or create_all would try to build the same index twice.
+    # Uniqueness is a UNIQUE INDEX (not a UniqueConstraint) on purpose: schema-sync
+    # reconciles missing *indexes* on already-existing tables, but not constraints.
+    # If two services race to create this table at boot (create_all), the loser can
+    # end up with the table but no constraint; a unique index self-heals on the next
+    # startup. ON CONFLICT (meeting_id, user_id) infers this index. email already
+    # carries index=True (-> ix_meeting_owners_email), so no explicit dup here.
     __table_args__ = (
-        UniqueConstraint('meeting_id', 'user_id', name='uq_meeting_owner_meeting_user'),
+        Index('uq_meeting_owner_meeting_user', 'meeting_id', 'user_id', unique=True),
     )
