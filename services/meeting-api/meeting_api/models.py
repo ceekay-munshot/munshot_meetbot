@@ -113,6 +113,10 @@ class CalendarEvent(Base):
     status = Column(Text, nullable=False, server_default='pending', default='pending')
     meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=True)
     sync_token = Column(Text, nullable=True)
+    # Raw Google Calendar attendee list captured at sync time:
+    # [{"email": ..., "displayName": ..., "responseStatus": ..., "organizer": bool, "self": bool}].
+    # Source of multi-owner: every attendee email becomes a meeting owner (see MeetingOwner).
+    attendees = Column(JSONB, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     meeting = relationship("Meeting")
@@ -121,4 +125,35 @@ class CalendarEvent(Base):
         UniqueConstraint('user_id', 'external_event_id', name='uq_calendar_event_user_ext_id'),
         Index('ix_calendar_events_start_time', 'start_time'),
         Index('ix_calendar_events_status', 'status'),
+    )
+
+
+class MeetingOwner(Base):
+    """Many-to-many: a meeting can have multiple owners (co-viewers).
+
+    Every calendar attendee (plus the organizer) becomes an owner so that each of
+    them can see the meeting/transcript they were invited to. ``email`` is
+    denormalized alongside ``user_id`` so the Cloudflare D1 mirror and per-client
+    filtering never need a join back to ``users``.
+
+    ``user_id`` is a bare Integer (no cross-Base FK) — the same pattern Meeting
+    uses, since User lives in a separate declarative Base (admin_models).
+    """
+    __tablename__ = "meeting_owners"
+
+    id = Column(Integer, primary_key=True, index=True)
+    meeting_id = Column(Integer, ForeignKey("meetings.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    # 'organizer' | 'attendee' — informational; both grant view access.
+    role = Column(String(50), nullable=False, server_default='attendee', default='attendee')
+    # Where this ownership came from: 'calendar' | 'requester' (future: 'manual').
+    source = Column(String(50), nullable=False, server_default='calendar', default='calendar')
+    created_at = Column(DateTime, server_default=func.now())
+
+    # email already carries index=True (-> ix_meeting_owners_email); no explicit
+    # duplicate here, or create_all would try to build the same index twice.
+    __table_args__ = (
+        UniqueConstraint('meeting_id', 'user_id', name='uq_meeting_owner_meeting_user'),
     )

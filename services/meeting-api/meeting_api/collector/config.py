@@ -45,3 +45,8 @@ CF_D1_TIMEOUT_SECONDS = float(os.environ.get("CF_D1_TIMEOUT_SECONDS", "10"))
 # Uses the same enable switch + credentials as the transcript mirror above.
 # See deploy/cloudflare-d1/schema_meetings.sql.
 CF_D1_MEETINGS_TABLE = os.environ.get("CF_D1_MEETINGS_TABLE", "meetings")
+
+# Meeting-owners mirror table — many-to-many (meeting_id, owner_email) so the
+# Cloudflare frontend can list a meeting for EVERY owner, not just the primary
+# owner_email stamped on transcript rows. See schema_meeting_owners.sql.
+CF_D1_OWNERS_TABLE = os.environ.get("CF_D1_OWNERS_TABLE", "meeting_owners")

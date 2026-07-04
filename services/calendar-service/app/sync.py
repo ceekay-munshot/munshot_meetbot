@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from meeting_api.models import CalendarEvent
+from meeting_api.owners import upsert_meeting_owners
+from meeting_api.collector.d1_owners_forwarder import mirror_meeting_owners_to_d1
 from admin_models.models import User
 from app.google_calendar import (
     refresh_access_token,
@@ -101,6 +103,10 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
         end_time = parse_event_time(event, "end")
         meeting_url = extract_meeting_url(event)
         platform = detect_platform(meeting_url) if meeting_url else None
+        # Keep the raw attendee list — every attendee becomes a meeting owner
+        # (co-viewer) when the bot is scheduled. Google omits this field for
+        # solo events; store [] then rather than NULL so re-syncs are stable.
+        attendees = event.get("attendees") or []
 
         stmt = pg_insert(CalendarEvent).values(
             user_id=user_id,
@@ -110,6 +116,7 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
             end_time=end_time,
             meeting_url=meeting_url,
             platform=platform,
+            attendees=attendees,
             status="pending",
         ).on_conflict_do_update(
             constraint="uq_calendar_event_user_ext_id",
@@ -119,6 +126,7 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
                 "end_time": end_time,
                 "meeting_url": meeting_url,
                 "platform": platform,
+                "attendees": attendees,
             },
         )
         await db.execute(stmt)
@@ -201,16 +209,40 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
 
             if resp.status_code in (200, 201):
                 resp_data = resp.json()
+                meeting_id = resp_data.get("id")
                 await db.execute(
                     update(CalendarEvent)
                     .where(CalendarEvent.id == event.id)
                     .values(
                         status="scheduled",
-                        meeting_id=resp_data.get("id"),
+                        meeting_id=meeting_id,
                     )
                 )
                 scheduled += 1
                 logger.info(f"Scheduled bot for event {event.id}: {event.title}")
+
+                # Multi-owner: every calendar attendee (+ the organizer) becomes an
+                # owner of this meeting so they can each see it. Auto-creates users
+                # for unknown emails. Best-effort — never let it break scheduling.
+                if meeting_id is not None:
+                    try:
+                        owners = await upsert_meeting_owners(
+                            db,
+                            meeting_id=meeting_id,
+                            attendees=event.attendees,
+                            primary_user_id=event.user_id,
+                            primary_email=getattr(user, "email", None),
+                        )
+                        # Mirror owner list to D1 so the frontend can show this
+                        # meeting to every owner (best-effort, never raises).
+                        await mirror_meeting_owners_to_d1(
+                            meeting_id, [o.email for o in owners]
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Owner materialization failed for meeting {meeting_id} "
+                            f"(event {event.id}), non-fatal: {e}"
+                        )
             else:
                 logger.error(f"Bot request failed for event {event.id}: {resp.status_code} {resp.text}")
                 await db.execute(
