@@ -29,10 +29,48 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 MEETING_API_URL = os.getenv("MEETING_API_URL", "http://meeting-api:8080")
 BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")
 DEFAULT_LEAD_TIME_MINUTES = int(os.getenv("DEFAULT_LEAD_TIME_MINUTES", "2"))
+# How far ahead to pull events from Google Calendar on each sync.
+CALENDAR_SYNC_WINDOW_DAYS = int(os.getenv("CALENDAR_SYNC_WINDOW_DAYS", "30"))
 # Display name for auto-dispatched bots (matches the product default).
 CALENDAR_BOT_NAME = os.getenv("DEFAULT_BOT_NAME", "munshot meetbot")
 # This fork is Google-Meet-only; ignore Zoom/Teams links found on calendars.
 GOOGLE_MEET_ONLY = os.getenv("CALENDAR_GOOGLE_MEET_ONLY", "true").lower() in ("1", "true", "yes")
+
+
+async def _list_all_events(
+    access_token: str,
+    time_min: Optional[datetime] = None,
+    time_max: Optional[datetime] = None,
+    sync_token: Optional[str] = None,
+) -> tuple[list, Optional[str], bool]:
+    """Follow Google's nextPageToken until exhausted so a wide time_min/time_max
+    window (e.g. 30 days) doesn't silently truncate to the first page of results.
+
+    Returns (all_items, next_sync_token, full_sync_required). nextSyncToken only
+    ever appears on the final page, so it's safe to just keep the last one seen.
+    """
+    all_items: list = []
+    next_sync_token: Optional[str] = None
+    page_token: Optional[str] = None
+
+    while True:
+        resp = await list_events(
+            access_token,
+            time_min=time_min,
+            time_max=time_max,
+            sync_token=sync_token,
+            page_token=page_token,
+        )
+        if resp.get("fullSyncRequired"):
+            return [], None, True
+
+        all_items.extend(resp.get("items", []))
+        next_sync_token = resp.get("nextSyncToken") or next_sync_token
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return all_items, next_sync_token, False
 
 
 async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
@@ -60,23 +98,17 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
     existing_sync_token = gc_data.get("sync_token")
 
     time_min = datetime.now(timezone.utc)
-    time_max = time_min + timedelta(days=7)
+    time_max = time_min + timedelta(days=CALENDAR_SYNC_WINDOW_DAYS)
 
-    api_response = await list_events(
-        access_token,
-        time_min=time_min,
-        time_max=time_max,
-        sync_token=existing_sync_token,
+    events, next_sync_token, full_sync_required = await _list_all_events(
+        access_token, time_min=time_min, time_max=time_max, sync_token=existing_sync_token,
     )
 
-    if api_response.get("fullSyncRequired"):
+    if full_sync_required:
         logger.info(f"Full sync required for user {user_id}, clearing sync token")
-        api_response = await list_events(
-            access_token, time_min=time_min, time_max=time_max
+        events, next_sync_token, _ = await _list_all_events(
+            access_token, time_min=time_min, time_max=time_max,
         )
-
-    events = api_response.get("items", [])
-    next_sync_token = api_response.get("nextSyncToken")
     upserted = 0
 
     for event in events:

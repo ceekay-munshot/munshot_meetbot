@@ -95,9 +95,15 @@ async def list_events(
     time_min: Optional[datetime] = None,
     time_max: Optional[datetime] = None,
     sync_token: Optional[str] = None,
-    max_results: int = 50,
+    max_results: int = 250,
+    page_token: Optional[str] = None,
 ) -> dict:
-    """Fetch events from Google Calendar API. Returns raw API response dict."""
+    """Fetch one page of events from Google Calendar API. Returns raw API response dict.
+
+    Callers wanting the full window must follow ``nextPageToken`` themselves
+    (see sync.py's ``list_all_events``) — Google paginates at ``max_results``
+    per call regardless of how wide time_min/time_max is.
+    """
     params: dict[str, str] = {
         "maxResults": str(max_results),
         "singleEvents": "true",
@@ -111,6 +117,9 @@ async def list_events(
             params["timeMin"] = time_min.isoformat()
         if time_max:
             params["timeMax"] = time_max.isoformat()
+
+    if page_token:
+        params["pageToken"] = page_token
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
