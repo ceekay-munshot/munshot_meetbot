@@ -932,11 +932,15 @@ async def request_bot(
         if not constructed_url:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Cannot construct meeting URL")
 
-    # Check for duplicate active meeting
+    # Check for a duplicate active meeting. Scoped by platform + native meeting
+    # ID ONLY (no user_id filter) — a real-world meeting can be requested by
+    # several different users (calendar organizer + attendee both auto-syncing,
+    # two separate /public/join calls for the same Meet link, etc.), and each
+    # would otherwise get its own bot sent into the SAME meeting. One bot per
+    # real meeting, regardless of who asked for it.
     existing_stmt = (
         select(Meeting)
         .where(
-            Meeting.user_id == current_user.id,
             Meeting.platform == req.platform.value,
             Meeting.platform_specific_id == native_meeting_id,
             Meeting.status.in_(["requested", "joining", "awaiting_admission", "active"]),
@@ -946,9 +950,22 @@ async def request_bot(
     )
     existing = (await db.execute(existing_stmt)).scalars().first()
     if existing:
+        if existing.user_id == current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An active or requested meeting already exists for this platform and meeting ID",
+            )
+        # A DIFFERENT user already has a bot in this same meeting — don't send
+        # a second one. Surface the existing meeting's id so callers (e.g.
+        # calendar sync) can add this requester as an owner/viewer instead of
+        # treating it as a hard failure.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"An active or requested meeting already exists for this platform and meeting ID",
+            detail={
+                "error": "meeting_already_active",
+                "message": "A bot is already active in this meeting (requested by another user).",
+                "existing_meeting_id": existing.id,
+            },
         )
 
     # Concurrency limit (exclude browser_session from count — they are infrastructure, not bots)

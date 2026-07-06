@@ -243,6 +243,38 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
                             f"Owner materialization failed for meeting {meeting_id} "
                             f"(event {event.id}), non-fatal: {e}"
                         )
+            elif resp.status_code == 409 and _existing_meeting_id(resp) is not None:
+                # Someone else's bot is already in this meeting (e.g. the
+                # organizer's calendar synced first). Don't treat this as a
+                # failure — just attach this event's user as an owner/viewer
+                # of the meeting that's already running.
+                meeting_id = _existing_meeting_id(resp)
+                await db.execute(
+                    update(CalendarEvent)
+                    .where(CalendarEvent.id == event.id)
+                    .values(status="scheduled", meeting_id=meeting_id)
+                )
+                scheduled += 1
+                logger.info(
+                    f"Event {event.id} ({event.title}): meeting {meeting_id} already has an "
+                    f"active bot from another user — joining as owner instead of duplicating it"
+                )
+                try:
+                    owners = await upsert_meeting_owners(
+                        db,
+                        meeting_id=meeting_id,
+                        attendees=event.attendees,
+                        primary_user_id=event.user_id,
+                        primary_email=getattr(user, "email", None),
+                    )
+                    await mirror_meeting_owners_to_d1(
+                        meeting_id, [o.email for o in owners]
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Owner materialization failed for existing meeting {meeting_id} "
+                        f"(event {event.id}), non-fatal: {e}"
+                    )
             else:
                 logger.error(f"Bot request failed for event {event.id}: {resp.status_code} {resp.text}")
                 await db.execute(
@@ -255,6 +287,15 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
 
     await db.commit()
     return scheduled
+
+
+def _existing_meeting_id(resp: httpx.Response) -> Optional[int]:
+    """Pull `detail.existing_meeting_id` out of meeting-api's 409 body, if present."""
+    try:
+        detail = resp.json().get("detail")
+        return detail.get("existing_meeting_id") if isinstance(detail, dict) else None
+    except Exception:
+        return None
 
 
 def _extract_native_id(url: str, platform: str) -> str:
