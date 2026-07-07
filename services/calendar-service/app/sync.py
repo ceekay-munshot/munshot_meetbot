@@ -20,6 +20,7 @@ from app.google_calendar import (
     extract_meeting_url,
     detect_platform,
     parse_event_time,
+    CalendarTokenRevoked,
 )
 
 logger = logging.getLogger("calendar-service.sync")
@@ -89,10 +90,29 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
         logger.info(f"User {user_id} has no Google Calendar refresh token")
         return 0
 
-    # Refresh access token
-    access_token, expires_in = await refresh_access_token(
-        GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, refresh_token
-    )
+    # Refresh access token. If Google says the token is permanently dead
+    # (invalid_grant), auto-disconnect the account: drop the stored oauth block
+    # so the sync loop stops hammering a dead token and the user falls back into
+    # the normal "not connected" path (frontend shows the reconnect prompt).
+    # Only invalid_grant triggers this — transient 5xx/network errors propagate
+    # and get retried on the next sync, never deleting a healthy token.
+    try:
+        access_token, expires_in = await refresh_access_token(
+            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, refresh_token
+        )
+    except CalendarTokenRevoked:
+        gc_data.pop("oauth", None)
+        gc_data.pop("sync_token", None)  # stale once the grant is gone
+        user_data["google_calendar"] = gc_data
+        await db.execute(
+            update(User).where(User.id == user_id).values(data=user_data)
+        )
+        await db.commit()
+        logger.warning(
+            f"User {user_id}: refresh token expired/revoked — auto-disconnected "
+            f"calendar; user must reconnect via /calendar/connect/start"
+        )
+        raise
 
     # Get existing sync token for incremental sync
     existing_sync_token = gc_data.get("sync_token")

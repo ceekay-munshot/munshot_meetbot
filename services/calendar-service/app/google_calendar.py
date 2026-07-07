@@ -16,6 +16,17 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 
+
+class CalendarTokenRevoked(Exception):
+    """The stored refresh token is permanently dead — Google returned
+    ``400 invalid_grant`` ("Token has been expired or revoked").
+
+    This is NOT a transient failure: no server-side retry can revive it, so
+    the caller should drop the stored token and force a fresh reconnect. It is
+    deliberately distinct from httpx transient errors (network / 5xx / rate
+    limit), which must keep retrying rather than nuke a healthy token.
+    """
+
 # openid+email so we can identify the connecting account from the id_token
 # (never trust a client-supplied email); calendar.readonly for sync.
 OAUTH_SCOPES = "openid email https://www.googleapis.com/auth/calendar.readonly"
@@ -85,6 +96,17 @@ async def refresh_access_token(
                 "refresh_token": refresh_token,
             },
         )
+        # A 400 invalid_grant means the refresh token is permanently dead
+        # (expired/revoked). Surface it as a distinct, non-retryable signal so
+        # the caller can drop it — separate from transient 5xx/network errors
+        # that raise_for_status() lumps together and which SHOULD keep retrying.
+        if resp.status_code == 400:
+            try:
+                err = resp.json().get("error")
+            except Exception:
+                err = None
+            if err == "invalid_grant":
+                raise CalendarTokenRevoked("Refresh token expired or revoked")
         resp.raise_for_status()
         data = resp.json()
         return data["access_token"], int(data.get("expires_in", 3600))

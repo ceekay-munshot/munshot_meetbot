@@ -30,6 +30,7 @@ from app.google_calendar import (
     build_consent_url,
     exchange_code_for_tokens,
     email_from_id_token,
+    CalendarTokenRevoked,
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -86,6 +87,13 @@ async def sync_loop():
                     if gc.get("oauth", {}).get("refresh_token"):
                         try:
                             await sync_user_calendar(user.id, db)
+                        except CalendarTokenRevoked:
+                            # Expected, self-healing: token already dropped inside
+                            # sync_user_calendar. Account now shows as disconnected.
+                            logger.info(
+                                f"User {user.id}: calendar auto-disconnected "
+                                f"(token expired/revoked) — awaiting reconnect"
+                            )
                         except Exception as e:
                             logger.error(f"Sync failed for user {user.id}: {e}")
 
@@ -301,6 +309,17 @@ async def sync_client_calendar(
 
     try:
         synced = await sync_user_calendar(user.id, db)
+    except CalendarTokenRevoked:
+        # sync_user_calendar has already dropped the dead token — report the
+        # account as (now) disconnected so the caller sends the client back
+        # through consent, instead of surfacing a hard 502.
+        return {
+            "connected": False,
+            "user_id": user.id,
+            "events_synced": 0,
+            "connect_url": connect_url,
+            "detail": "Calendar token expired or revoked — reconnect required.",
+        }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Calendar sync failed: {e}")
     return {"connected": True, "user_id": user.id, "events_synced": synced}
