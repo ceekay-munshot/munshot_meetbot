@@ -319,6 +319,14 @@ services:
       - SYNC_INTERVAL_SECONDS=${CALENDAR_SYNC_INTERVAL_SECONDS:-300}
       - DEFAULT_LEAD_TIME_MINUTES=${CALENDAR_LEAD_TIME_MINUTES:-2}
       - CALENDAR_SYNC_WINDOW_DAYS=${CALENDAR_SYNC_WINDOW_DAYS:-30}
+      # Cloudflare D1 creds: calendar-service mirrors the multi-owner list
+      # (mirror_meeting_owners_to_d1) so every calendar attendee can see the
+      # meeting on the frontend. Without these the owners sink silently skips
+      # (_is_configured() → False) and the D1 meeting_owners table stays empty.
+      - CLOUDFLARE_D1_ENABLED=${CLOUDFLARE_D1_ENABLED:-false}
+      - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
+      - CF_D1_DATABASE_ID=${CF_D1_DATABASE_ID:-}
+      - CF_API_TOKEN=${CF_API_TOKEN:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     init: true
     depends_on:
