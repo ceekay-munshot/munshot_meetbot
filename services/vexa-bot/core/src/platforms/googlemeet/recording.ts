@@ -167,14 +167,15 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
       // MediaRecorder simply starts fresh when people arrive, so chunk 0 still
       // carries the container header and t=0 aligns to first real audio. The
       // browser-side monitoring loop calls window.__vexaArmRecording() the
-      // moment tile count > 1. Idempotent (guarded by recordingArmed).
+      // moment tile count > 2 (2+ real humans, excluding the bot's own
+      // tile). Idempotent (guarded by recordingArmed).
       let recordingArmed = false;
       const armRecording = async () => {
         if (recordingArmed) return;
         recordingArmed = true;
         try {
           await pipeline!.start();
-          log("[Google Recording] 2+ participants present — recording armed (MediaRecorder → chunked upload)");
+          log("[Google Recording] 2+ human participants present — recording armed (MediaRecorder → chunked upload)");
           // Start the active-speaker sampler aligned with recording t=0 so the
           // post-meeting batch job can map Deepgram diarization indices to names.
           if (botConfig.speakerTimelineUploadUrl) {
@@ -190,7 +191,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
         // into the page.
         armRecording().catch(() => {});
       });
-      log("[Google Recording] Recording pipeline constructed; start deferred until 2+ participants present (token-saving)");
+      log("[Google Recording] Recording pipeline constructed; start deferred until 2+ human participants present (token-saving)");
     }
   } else {
     log("[Google Recording] Audio capture disabled by config.");
@@ -637,10 +638,10 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
               // Check participant count using the comprehensive helper
               const currentParticipantCount = (window as any).getGoogleMeetActiveParticipantsCount ? (window as any).getGoogleMeetActiveParticipantsCount() : 0;
 
-              // Presence-gated recording: arm audio capture the moment a 2nd
-              // participant is present (count includes the bot's own tile, so
-              // >1 means at least one real human). Idempotent on the Node side.
-              if (currentParticipantCount > 1) {
+              // Presence-gated recording: arm audio capture only once 2 real
+              // humans are present (count includes the bot's own tile, so
+              // >2 means at least two real humans). Idempotent on the Node side.
+              if (currentParticipantCount > 2) {
                 (window as any).__vexaArmRecording?.();
               }
 
@@ -656,7 +657,10 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 }
               }
 
-              if (currentParticipantCount <= 1) {
+              // <=2 covers both "everyone left" (0 humans) and "only one
+              // human remains" (1 human) — both count down to the same
+              // leave timeout once speakers have been identified.
+              if (currentParticipantCount <= 2) {
                 // v0.10.5 #285 Layer 2 — audio cross-validate before incrementing
                 // aloneTime. If audio activity within last 120s, the meeting has
                 // speakers regardless of what the DOM count says (DOM heuristic
@@ -682,7 +686,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
 
                 if (aloneTime >= currentTimeout) {
                   if (speakersIdentified) {
-                    (window as any).logBot(`Google Meet meeting ended or bot has been alone for ${everyoneLeftTimeoutSeconds} seconds after speakers were identified. Stopping recorder...`);
+                    (window as any).logBot(`Google Meet meeting ended or fewer than 2 other participants present for ${everyoneLeftTimeoutSeconds} seconds after speakers were identified (currentParticipantCount=${currentParticipantCount}). Stopping recorder...`);
                     stopMonitoring("left_alone_timeout", () =>
                       reject(new Error("GOOGLE_MEET_BOT_LEFT_ALONE_TIMEOUT"))
                     );
@@ -694,7 +698,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                   }
                 } else if (aloneTime > 0 && aloneTime % 10 === 0) { // Log every 10 seconds to avoid spam
                   if (speakersIdentified) {
-                    (window as any).logBot(`Bot has been alone for ${aloneTime} seconds (${timeoutDescription} mode). Will leave in ${currentTimeout - aloneTime} more seconds.`);
+                    (window as any).logBot(`Bot has fewer than 2 other participants (currentParticipantCount=${currentParticipantCount}) for ${aloneTime} seconds (${timeoutDescription} mode). Will leave in ${currentTimeout - aloneTime} more seconds.`);
                   } else {
                     const remainingMinutes = Math.floor((currentTimeout - aloneTime) / 60);
                     const remainingSeconds = (currentTimeout - aloneTime) % 60;
@@ -702,7 +706,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                   }
                 }
               } else {
-                aloneTime = 0; // Reset if others are present
+                aloneTime = 0; // Reset once 2+ other humans are present
                 if (hasEverHadMultipleParticipants && !speakersIdentified) {
                   speakersIdentified = true;
                   (window as any).logBot("Speakers identified - switching to post-speaker monitoring mode");

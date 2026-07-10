@@ -240,8 +240,8 @@ The bot enforces two timeouts internally via `automaticLeave` in BOT_CONFIG:
 | BOT_CONFIG field | API name | Default | What happens |
 |-----------------|----------|---------|-------------|
 | `automaticLeave.waitingRoomTimeout` | `max_wait_for_admission` | 900000 (15 min) | Bot sends `completed` callback with reason `awaiting_admission_timeout` |
-| `automaticLeave.everyoneLeftTimeout` | `max_time_left_alone` | 900000 (15 min) | Bot sends `completed` callback with reason `left_alone` |
-| `automaticLeave.noOneJoinedTimeout` | `no_one_joined_timeout` | 120000 (2 min) | Bot sends `completed` callback |
+| `automaticLeave.everyoneLeftTimeout` | `max_time_left_alone` | 300000 (5 min) | Fires once 1 or 0 real humans remain (bot's own tile always counts). Bot sends `completed` callback with reason `left_alone` |
+| `automaticLeave.noOneJoinedTimeout` | `no_one_joined_timeout` | 900000 (15 min) | Bot sends `completed` callback |
 
 **Note:** `max_bot_time` (absolute max lifetime) is NOT enforced by the bot. It's enforced server-side by the scheduler, which fires `DELETE /bots` regardless of bot state. This is defense in depth — even if the bot hangs, the scheduler kills it. See `features/bot-lifecycle/README.md`.
 

@@ -1127,7 +1127,7 @@ async def request_bot(
     SYSTEM_DEFAULTS = {
         "max_bot_time": 7200000,          # 2h
         "max_wait_for_admission": 900000, # 15 min
-        "max_time_left_alone": 900000,    # 15 min
+        "max_time_left_alone": 300000,    # 5 min — everyone gone, or only 1 human left
         "no_one_joined_timeout": 900000,  # 15 min — wait for stragglers before giving up
     }
 
