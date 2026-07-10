@@ -612,7 +612,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
             let aloneTime = 0;
             let lastParticipantCount = 0;
             let speakersIdentified = false;
-            let hasEverHadMultipleParticipants = false;
+            let hasEverHadRecordingQuorum = false;
             let monitoringStopped = false;
 
             const stopMonitoring = (
@@ -649,10 +649,14 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 (window as any).logBot(`Participant check: Found ${currentParticipantCount} unique participants from central list.`);
                 lastParticipantCount = currentParticipantCount;
 
-                // Track if we've ever had multiple participants
-                if (currentParticipantCount > 1) {
-                  hasEverHadMultipleParticipants = true;
-                  speakersIdentified = true; // Once we see multiple participants, we've identified speakers
+                // Only switch out of the 15min startup grace window once
+                // recording has actually armed (2+ real humans, count > 2).
+                // A single early joiner must NOT cut the grace window down
+                // to the 5min post-start timeout — they may still be
+                // waiting on everyone else.
+                if (currentParticipantCount > 2) {
+                  hasEverHadRecordingQuorum = true;
+                  speakersIdentified = true; // Recording has started — switch to post-speaker monitoring
                   (window as any).logBot("Speakers identified - switching to post-speaker monitoring mode");
                 }
               }
@@ -707,7 +711,7 @@ export async function startGoogleRecording(page: Page, botConfig: BotConfig): Pr
                 }
               } else {
                 aloneTime = 0; // Reset once 2+ other humans are present
-                if (hasEverHadMultipleParticipants && !speakersIdentified) {
+                if (hasEverHadRecordingQuorum && !speakersIdentified) {
                   speakersIdentified = true;
                   (window as any).logBot("Speakers identified - switching to post-speaker monitoring mode");
                 }
