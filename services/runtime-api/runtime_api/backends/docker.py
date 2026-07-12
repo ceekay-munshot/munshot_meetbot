@@ -15,7 +15,15 @@ import requests_unixsocket
 
 from runtime_api import config
 from runtime_api.backends import Backend, ContainerInfo, ContainerSpec
-from runtime_api.utils import parse_memory
+from runtime_api.utils import parse_cpu, parse_memory
+
+# Docker's default cgroup accounting window (100ms). CpuQuota is expressed
+# in the same units — quota/period = fractional cores allowed per window.
+CPU_PERIOD_US = 100_000
+# Kubernetes' cgroup-v1 convention: 1 CPU == 1024 shares. Mirrored here so
+# cpu_request (soft priority) and cpu_limit (hard cap) agree in relative
+# weight with what the profile authors intended when they wrote "1000m".
+CPU_SHARES_PER_CORE = 1024
 
 logger = logging.getLogger("runtime_api.backends.docker")
 
@@ -179,6 +187,19 @@ class DockerBackend(Backend):
         # Resource limits
         if spec.memory_limit:
             host_config["Memory"] = parse_memory(spec.memory_limit)
+        # cpu_limit/cpu_request (e.g. "1500m") were previously accepted by
+        # ContainerSpec but silently dropped here — Docker only honored
+        # memory_limit, so bots contended for the whole host's CPU instead
+        # of the profile's declared budget. CpuQuota/CpuPeriod give a hard
+        # cap; CpuShares gives cpu_request its intended relative-priority
+        # meaning under contention (both are cgroup-v1/v2 portable).
+        if spec.cpu_limit:
+            cores = parse_cpu(spec.cpu_limit)
+            host_config["CpuPeriod"] = CPU_PERIOD_US
+            host_config["CpuQuota"] = int(cores * CPU_PERIOD_US)
+        if spec.cpu_request:
+            cores = parse_cpu(spec.cpu_request)
+            host_config["CpuShares"] = max(2, round(cores * CPU_SHARES_PER_CORE))
 
         payload: dict[str, Any] = {
             "Image": spec.image,

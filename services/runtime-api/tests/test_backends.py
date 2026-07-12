@@ -220,6 +220,82 @@ def test_docker_env_list_special_chars():
     assert 'JSON={"key":"val"}' in env_list
 
 
+# --- Docker backend: CPU limits ---
+#
+# cpu_request/cpu_limit were accepted by ContainerSpec and used by profiles
+# (e.g. the "meeting" profile's cpu_limit: "1500m") but silently dropped by
+# the Docker backend — only memory_limit was ever translated into a
+# HostConfig field, so bots contended for the whole host's CPU instead of
+# the profile's declared budget. These tests exercise the real _create_sync
+# code path (not a reimplementation) so a future silent-drop regresses loudly.
+
+
+def test_parse_cpu_millicores():
+    from runtime_api.utils import parse_cpu
+    assert parse_cpu("1500m") == 1.5
+    assert parse_cpu("500m") == 0.5
+
+
+def test_parse_cpu_whole_cores():
+    from runtime_api.utils import parse_cpu
+    assert parse_cpu("2") == 2.0
+    assert parse_cpu("0.5") == 0.5
+
+
+def _make_docker_backend_with_fake_session(post_response_status=201, post_response_json=None):
+    """Build a DockerBackend with _get_session()/_init_socket() short-circuited
+    to a fake session, so _create_sync can be driven without a real socket."""
+    from runtime_api.backends.docker import DockerBackend
+
+    backend = DockerBackend()
+    backend._socket_url = "http+unix://%2Fvar%2Frun%2Fdocker.sock"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = post_response_status
+    fake_resp.json.return_value = post_response_json or {"Id": "abc123"}
+    fake_resp.raise_for_status.return_value = None
+
+    fake_session = MagicMock()
+    fake_session.post.return_value = fake_resp
+
+    backend._session = fake_session
+    return backend, fake_session
+
+
+def test_docker_create_applies_cpu_limit_as_quota():
+    """cpu_limit ('1500m') becomes CpuQuota/CpuPeriod (1.5 cores)."""
+    backend, fake_session = _make_docker_backend_with_fake_session()
+    spec = ContainerSpec(
+        name="meeting-61-test",
+        image="vexaai/vexa-bot:latest",
+        cpu_request="1000m",
+        cpu_limit="1500m",
+    )
+
+    backend._create_sync(spec)
+
+    create_call = next(c for c in fake_session.post.call_args_list if "/containers/create" in c.args[0])
+    host_config = create_call.kwargs["json"]["HostConfig"]
+    assert host_config["CpuPeriod"] == 100_000
+    assert host_config["CpuQuota"] == 150_000  # 1.5 cores * 100_000us period
+    assert host_config["CpuShares"] == 1024    # 1.0 core * 1024 shares/core
+
+
+def test_docker_create_omits_cpu_fields_when_unset():
+    """No cpu_request/cpu_limit on the spec -> no CPU keys in HostConfig
+    (preserves behavior for profiles that don't set them)."""
+    backend, fake_session = _make_docker_backend_with_fake_session()
+    spec = ContainerSpec(name="agent-1-test", image="vexaai/agent:latest")
+
+    backend._create_sync(spec)
+
+    create_call = next(c for c in fake_session.post.call_args_list if "/containers/create" in c.args[0])
+    host_config = create_call.kwargs["json"]["HostConfig"]
+    assert "CpuQuota" not in host_config
+    assert "CpuPeriod" not in host_config
+    assert "CpuShares" not in host_config
+
+
 # --- K8s backend: pod spec ---
 
 

@@ -13,3 +13,11 @@ def parse_memory(mem_str: str) -> int:
         if mem_str.lower().endswith(suffix):
             return int(float(mem_str[:-len(suffix)]) * mult)
     return int(mem_str)
+
+
+def parse_cpu(cpu_str: str) -> float:
+    """Parse Kubernetes-style CPU string ('1500m', '2', '0.5') to cores."""
+    cpu_str = cpu_str.strip()
+    if cpu_str.lower().endswith("m"):
+        return float(cpu_str[:-1]) / 1000
+    return float(cpu_str)
