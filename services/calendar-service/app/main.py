@@ -31,6 +31,7 @@ from app.google_calendar import (
     exchange_code_for_tokens,
     email_from_id_token,
     CalendarTokenRevoked,
+    CalendarScopeInsufficient,
 )
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -93,6 +94,14 @@ async def sync_loop():
                             logger.info(
                                 f"User {user.id}: calendar auto-disconnected "
                                 f"(token expired/revoked) — awaiting reconnect"
+                            )
+                        except CalendarScopeInsufficient:
+                            # Expected, self-healing: grant already dropped inside
+                            # sync_user_calendar. The user consented without granting
+                            # calendar access, so there is nothing to retry.
+                            logger.info(
+                                f"User {user.id}: calendar auto-disconnected "
+                                f"(consent granted without calendar scope) — awaiting reconnect"
                             )
                         except Exception as e:
                             logger.error(f"Sync failed for user {user.id}: {e}")
@@ -319,6 +328,22 @@ async def sync_client_calendar(
             "events_synced": 0,
             "connect_url": connect_url,
             "detail": "Calendar token expired or revoked — reconnect required.",
+        }
+    except CalendarScopeInsufficient:
+        # Live grant, but the user completed consent without ticking the
+        # calendar checkbox — so it can read nothing. sync_user_calendar has
+        # already dropped it; same reconnect path as a revoked token (a scope
+        # cannot be added to an existing grant). Without this branch every sync
+        # for that client 502s forever while the account still looks connected.
+        return {
+            "connected": False,
+            "user_id": user.id,
+            "events_synced": 0,
+            "connect_url": connect_url,
+            "detail": (
+                "Calendar permission was not granted — reconnect and allow "
+                "calendar access to continue."
+            ),
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Calendar sync failed: {e}")
@@ -557,7 +582,19 @@ async def restore_client_meeting(
 @app.post("/calendar/connect")
 async def connect_calendar(user_id: int = Query(...), db: AsyncSession = Depends(get_db)):
     """Trigger initial sync after OAuth connection."""
-    count = await sync_user_calendar(user_id, db)
+    try:
+        count = await sync_user_calendar(user_id, db)
+    except (CalendarTokenRevoked, CalendarScopeInsufficient):
+        # Grant is dead or carries no calendar scope; sync_user_calendar has
+        # already dropped it. Report disconnected rather than a raw 500 — the
+        # caller's remedy is the same either way: send the user through consent.
+        connect_url = f"{PUBLIC_BASE_URL}/calendar/connect/start" if PUBLIC_BASE_URL else None
+        return {
+            "status": "disconnected",
+            "events_synced": 0,
+            "connect_url": connect_url,
+            "detail": "Calendar access not granted — reconnect required.",
+        }
     return {"status": "connected", "events_synced": count}
 
 

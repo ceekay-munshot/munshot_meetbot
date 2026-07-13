@@ -27,6 +27,22 @@ class CalendarTokenRevoked(Exception):
     limit), which must keep retrying rather than nuke a healthy token.
     """
 
+
+class CalendarScopeInsufficient(Exception):
+    """The grant is alive but carries no calendar scope — Google returned
+    ``403 ACCESS_TOKEN_SCOPE_INSUFFICIENT`` on events.list.
+
+    Happens when a user completes the consent screen WITHOUT ticking the
+    calendar permission checkbox: they grant openid+email only, so the refresh
+    token stays perfectly valid (token refresh returns 200) while every
+    events.list is rejected. CalendarTokenRevoked never fires, so without this
+    the account looks "connected" forever and each sync 500s.
+
+    Permanently unfixable server-side — a scope cannot be added to an existing
+    grant — so it is treated exactly like a revoked token: drop the stored
+    oauth block and send the user back through consent.
+    """
+
 # openid+email so we can identify the connecting account from the id_token
 # (never trust a client-supplied email); calendar.readonly for sync.
 OAUTH_SCOPES = "openid email https://www.googleapis.com/auth/calendar.readonly"
@@ -152,8 +168,37 @@ async def list_events(
         if resp.status_code == 410:
             # Sync token expired — caller should do a full sync
             return {"items": [], "nextSyncToken": None, "fullSyncRequired": True}
+        # A 403 with reason ACCESS_TOKEN_SCOPE_INSUFFICIENT / insufficientPermissions
+        # means the grant carries no calendar scope (consent screen completed
+        # without ticking the calendar checkbox). Non-retryable: surface it as a
+        # distinct signal so the caller can drop the grant and prompt a reconnect,
+        # rather than raise_for_status() turning it into an opaque 502. Other 403s
+        # (rate limit / quota) must keep retrying, so they fall through untouched.
+        if resp.status_code == 403 and _is_scope_error(resp):
+            raise CalendarScopeInsufficient(
+                "Grant is missing calendar.readonly — user must re-consent"
+            )
         resp.raise_for_status()
         return resp.json()
+
+
+def _is_scope_error(resp: httpx.Response) -> bool:
+    """True if a Google 403 body is an insufficient-scope error (not a quota one)."""
+    try:
+        err = resp.json().get("error", {})
+    except Exception:
+        return False
+    if any(
+        d.get("reason") == "ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+        for d in err.get("details", [])
+        if isinstance(d, dict)
+    ):
+        return True
+    return any(
+        e.get("reason") == "insufficientPermissions"
+        for e in err.get("errors", [])
+        if isinstance(e, dict)
+    )
 
 
 # --- Meeting URL extraction ---

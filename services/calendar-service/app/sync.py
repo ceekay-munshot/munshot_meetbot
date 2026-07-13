@@ -21,6 +21,7 @@ from app.google_calendar import (
     detect_platform,
     parse_event_time,
     CalendarTokenRevoked,
+    CalendarScopeInsufficient,
 )
 
 logger = logging.getLogger("calendar-service.sync")
@@ -90,6 +91,21 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
         logger.info(f"User {user_id} has no Google Calendar refresh token")
         return 0
 
+    async def _auto_disconnect(reason: str) -> None:
+        """Drop the stored grant so the account falls back to the normal
+        "not connected" path and the frontend shows the reconnect prompt."""
+        gc_data.pop("oauth", None)
+        gc_data.pop("sync_token", None)  # stale once the grant is gone
+        user_data["google_calendar"] = gc_data
+        await db.execute(
+            update(User).where(User.id == user_id).values(data=user_data)
+        )
+        await db.commit()
+        logger.warning(
+            f"User {user_id}: {reason} — auto-disconnected calendar; "
+            f"user must reconnect via /calendar/connect/start"
+        )
+
     # Refresh access token. If Google says the token is permanently dead
     # (invalid_grant), auto-disconnect the account: drop the stored oauth block
     # so the sync loop stops hammering a dead token and the user falls back into
@@ -101,17 +117,7 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
             GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, refresh_token
         )
     except CalendarTokenRevoked:
-        gc_data.pop("oauth", None)
-        gc_data.pop("sync_token", None)  # stale once the grant is gone
-        user_data["google_calendar"] = gc_data
-        await db.execute(
-            update(User).where(User.id == user_id).values(data=user_data)
-        )
-        await db.commit()
-        logger.warning(
-            f"User {user_id}: refresh token expired/revoked — auto-disconnected "
-            f"calendar; user must reconnect via /calendar/connect/start"
-        )
+        await _auto_disconnect("refresh token expired/revoked")
         raise
 
     # Get existing sync token for incremental sync
@@ -120,15 +126,23 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
     time_min = datetime.now(timezone.utc)
     time_max = time_min + timedelta(days=CALENDAR_SYNC_WINDOW_DAYS)
 
-    events, next_sync_token, full_sync_required = await _list_all_events(
-        access_token, time_min=time_min, time_max=time_max, sync_token=existing_sync_token,
-    )
-
-    if full_sync_required:
-        logger.info(f"Full sync required for user {user_id}, clearing sync token")
-        events, next_sync_token, _ = await _list_all_events(
-            access_token, time_min=time_min, time_max=time_max,
+    # A live grant with no calendar scope (consent screen completed without
+    # ticking the calendar checkbox) refreshes fine but 403s on every
+    # events.list. Same remedy as a revoked token — the scope can't be added
+    # server-side, so drop the grant and make the user re-consent.
+    try:
+        events, next_sync_token, full_sync_required = await _list_all_events(
+            access_token, time_min=time_min, time_max=time_max, sync_token=existing_sync_token,
         )
+
+        if full_sync_required:
+            logger.info(f"Full sync required for user {user_id}, clearing sync token")
+            events, next_sync_token, _ = await _list_all_events(
+                access_token, time_min=time_min, time_max=time_max,
+            )
+    except CalendarScopeInsufficient:
+        await _auto_disconnect("grant is missing calendar.readonly scope")
+        raise
     upserted = 0
 
     for event in events:
