@@ -21,10 +21,11 @@ from __future__ import annotations
 import bisect
 import os
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
-from sqlalchemy import text as sql_text
+from sqlalchemy import select, text as sql_text
 from sqlalchemy.orm.attributes import flag_modified
 
 from .models import Meeting
@@ -37,6 +38,11 @@ logger = logging.getLogger("meeting_api.batch_transcribe")
 
 _BATCH_LANGUAGE = os.getenv("BATCH_TRANSCRIBE_LANGUAGE", "").strip()  # "" -> service default ('multi')
 _BATCH_TIMEOUT_S = float(os.getenv("BATCH_TRANSCRIBE_TIMEOUT_SECONDS", "600"))
+# How long a claim is honoured before a later caller may treat the run as dead
+# and retry it. Must exceed the worst-case run (audio assembly + the Deepgram
+# call, itself capped at _BATCH_TIMEOUT_S) or a slow-but-healthy run would be
+# duplicated by the very mechanism meant to prevent duplicates.
+_CLAIM_TTL_S = float(os.getenv("BATCH_TRANSCRIBE_CLAIM_TTL_SECONDS", "1800"))
 
 
 def _service_base_url() -> str:
@@ -163,21 +169,110 @@ async def _call_batch_service(audio_bytes: bytes, fmt: str) -> Optional[dict]:
     return resp.json()
 
 
+async def _claim_batch_run(meeting_id: int, force: bool) -> Optional[dict]:
+    """Atomically take ownership of this meeting's batch run.
+
+    Returns the meeting's data dict if we own the run, else None.
+
+    run_all_tasks() fires from BOTH the container-exit callback and the terminal
+    status_change handler (callbacks.py), so two invocations routinely race. A
+    plain read of ``batch_transcribed`` cannot stop them: the flag is only set
+    ~30s later, after the audio is assembled and Deepgram has answered, so both
+    callers read False and both bill a full transcription of the same audio.
+    Meeting 66 was transcribed twice, one second apart.
+
+    Claiming under a row lock (same pattern as outbound_events.claim_outbound_event)
+    closes the window: exactly one caller writes the claim and proceeds. A claim
+    older than _CLAIM_TTL_S is treated as abandoned so a crashed run can be retried.
+    """
+    async with async_session_local() as db:
+        try:
+            meeting = (
+                await db.execute(
+                    select(Meeting)
+                    .where(Meeting.id == meeting_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if not meeting:
+                logger.error(f"batch_transcribe: meeting {meeting_id} not found")
+                await db.rollback()
+                return None
+
+            data_obj = dict(meeting.data or {})
+
+            if data_obj.get("batch_transcribed") and not force:
+                logger.info(f"batch_transcribe: meeting {meeting_id} already batch-transcribed; skipping")
+                await db.rollback()
+                return None
+
+            claimed_at = data_obj.get("batch_transcribe_claimed_at")
+            if claimed_at is not None and not force:
+                age = time.time() - float(claimed_at)
+                if age < _CLAIM_TTL_S:
+                    logger.info(
+                        f"batch_transcribe: meeting {meeting_id} already claimed {age:.0f}s ago "
+                        f"by a concurrent run; skipping (would have double-billed Deepgram)"
+                    )
+                    await db.rollback()
+                    return None
+                logger.warning(
+                    f"batch_transcribe: meeting {meeting_id} reclaiming stale run "
+                    f"({age:.0f}s old, TTL {_CLAIM_TTL_S}s) — previous attempt likely crashed"
+                )
+
+            data_obj["batch_transcribe_claimed_at"] = time.time()
+            meeting.data = data_obj
+            flag_modified(meeting, "data")
+            await db.commit()
+            return data_obj
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"batch_transcribe: failed to claim meeting {meeting_id}: {e}", exc_info=True)
+            return None
+
+
+async def _release_claim(meeting_id: int) -> None:
+    """Drop the claim after a failed run so the meeting can be retried."""
+    try:
+        async with async_session_local() as db:
+            meeting = await db.get(Meeting, meeting_id)
+            if meeting:
+                d = dict(meeting.data or {})
+                if d.pop("batch_transcribe_claimed_at", None) is not None:
+                    meeting.data = d
+                    flag_modified(meeting, "data")
+                    await db.commit()
+    except Exception as e:
+        logger.error(f"batch_transcribe: failed to release claim on meeting {meeting_id}: {e}")
+
+
 async def batch_transcribe_meeting(meeting_id: int, force: bool = False) -> bool:
     """Run the whole-meeting batch transcript. Returns True if it wrote segments."""
-    # 1. Load meeting + recording metadata; bail early if nothing to do.
-    async with async_session_local() as db:
-        meeting = await db.get(Meeting, meeting_id)
-        if not meeting:
-            logger.error(f"batch_transcribe: meeting {meeting_id} not found")
-            return False
-        data_obj = dict(meeting.data or {})
-        if data_obj.get("batch_transcribed") and not force:
-            logger.info(f"batch_transcribe: meeting {meeting_id} already batch-transcribed; skipping")
-            return False
-        rec = data_obj.get("recording") or {}
-        session_uid = rec.get("session_uid")
-        timeline = (data_obj.get("speaker_timeline") or {}).get("samples") or []
+    # 1. Take the run under a row lock, so concurrent callers can't both pay
+    #    Deepgram for the same audio. Everything below is guarded by the claim.
+    data_obj = await _claim_batch_run(meeting_id, force)
+    if data_obj is None:
+        return False
+
+    ok = False
+    try:
+        ok = await _run_claimed_batch(meeting_id, data_obj)
+        return ok
+    finally:
+        # A run that didn't finish leaves no batch_transcribed flag, so drop the
+        # claim to let a later attempt (sweep / manual force) retry it. A success
+        # keeps the claim alongside the flag — harmless, and it records the run.
+        if not ok:
+            await _release_claim(meeting_id)
+
+
+async def _run_claimed_batch(meeting_id: int, data_obj: dict) -> bool:
+    """The batch run proper. Only ever called by the caller holding the claim."""
+    rec = data_obj.get("recording") or {}
+    session_uid = rec.get("session_uid")
+    timeline = (data_obj.get("speaker_timeline") or {}).get("samples") or []
 
     # 2. Assemble the full audio from MinIO chunks.
     try:
