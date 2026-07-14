@@ -70,6 +70,10 @@ _COLUMNS = (
     "meeting_id",
     "user_id",
     "platform",
+    # Human-friendly title (calendar event name, or a dashboard rename). Without
+    # it the frontend can only show the raw Meet code (e.g. "pde-wqqa-ebn"),
+    # since D1 is its only read source.
+    "name",
     "native_meeting_id",
     "status",
     "bot_name",
@@ -112,6 +116,9 @@ def build_snapshot(meeting: Meeting) -> dict:
         "meeting_id": meeting.id,
         "user_id": meeting.user_id,
         "platform": meeting.platform,
+        # Same `name` -> `title` fallback the dashboard uses (meeting-card.tsx),
+        # so both surfaces resolve the meeting's display name identically.
+        "name": data.get("name") or data.get("title"),
         "native_meeting_id": meeting.platform_specific_id,
         "status": meeting.status,
         "bot_name": data.get("bot_name"),

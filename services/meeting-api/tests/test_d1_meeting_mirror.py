@@ -44,6 +44,7 @@ class TestBuildSnapshot:
             created_at=now,
             updated_at=now,
             data={
+                "name": "Weekly catchup call",
                 "bot_name": "Acme Notetaker",
                 "language": "en",
                 "transcribe_enabled": True,
@@ -66,6 +67,9 @@ class TestBuildSnapshot:
         assert snap["platform"] == TEST_PLATFORM
         assert snap["native_meeting_id"] == TEST_NATIVE_MEETING_ID
         assert snap["status"] == "completed"
+        # The display title — D1 is the frontend's only read source, so without
+        # this it can only show the raw Meet code.
+        assert snap["name"] == "Weekly catchup call"
         assert snap["bot_name"] == "Acme Notetaker"
         assert snap["language"] == "en"
         assert snap["transcribe_enabled"] == 1
@@ -78,7 +82,7 @@ class TestBuildSnapshot:
 
         # No secrets, no surprise fields. Lock the column set in place.
         expected_keys = {
-            "meeting_id", "user_id", "platform", "native_meeting_id",
+            "meeting_id", "user_id", "platform", "name", "native_meeting_id",
             "status", "bot_name", "language",
             "transcribe_enabled", "recording_enabled",
             "segment_count", "started_at", "ended_at",
@@ -91,6 +95,28 @@ class TestBuildSnapshot:
         assert "worker.example.com" not in str(snap)
         assert "passcode" not in snap
         assert "1234" not in str(snap)
+
+    def test_name_falls_back_to_title_then_none(self):
+        """`name` mirrors the dashboard's own resolution order (meeting-card.tsx):
+        data.name, else data.title, else nothing to show."""
+        from meeting_api.collector.d1_meeting_forwarder import build_snapshot
+        from meeting_api.models import Meeting
+
+        now = datetime(2026, 5, 1, 12, 0, 0)
+
+        def _m(data):
+            return Meeting(
+                id=TEST_MEETING_ID, user_id=TEST_USER_ID, platform=TEST_PLATFORM,
+                platform_specific_id=TEST_NATIVE_MEETING_ID, status="completed",
+                start_time=now, end_time=now, created_at=now, updated_at=now,
+                data=data,
+            )
+
+        assert build_snapshot(_m({"name": "Standup", "title": "Ignored"}))["name"] == "Standup"
+        assert build_snapshot(_m({"title": "From calendar"}))["name"] == "From calendar"
+        # An unnamed meeting (e.g. a bare /public/join) mirrors NULL, and the
+        # frontend falls back to the Meet code.
+        assert build_snapshot(_m({}))["name"] is None
 
     def test_snapshot_handles_minimal_meeting(self):
         from meeting_api.collector.d1_meeting_forwarder import build_snapshot
@@ -110,7 +136,7 @@ class TestBuildSnapshot:
 class TestUpsertSql:
     def test_upsert_keyed_on_meeting_id_and_refreshes_mutables(self):
         from meeting_api.collector.d1_meeting_forwarder import (
-            _build_upsert, build_snapshot,
+            _build_upsert, build_snapshot, _COLUMNS,
         )
         meeting = make_meeting(data={"transcribe_enabled": True, "segment_count": 5})
         snap = build_snapshot(meeting)
@@ -118,15 +144,17 @@ class TestUpsertSql:
         sql = chunk["sql"].lower()
         assert "insert into" in sql
         assert "on conflict (meeting_id) do update" in sql
-        # Mutable columns get refreshed on conflict
-        for col in ("status", "segment_count", "updated_at", "completion_reason"):
+        # Mutable columns get refreshed on conflict — including `name`, so a
+        # dashboard rename or a late calendar title propagates to D1.
+        for col in ("status", "segment_count", "updated_at", "completion_reason", "name"):
             assert f"{col}=excluded.{col}" in sql, f"missing refresh of {col}"
         # The key column must NOT be refreshed
         assert "meeting_id=excluded.meeting_id" not in sql
         # created_at must NOT be overwritten by later snapshots
         assert "created_at=excluded.created_at" not in sql
-        # Params arity matches columns
-        assert len(chunk["params"]) == 16
+        # Params arity tracks the column set (derived, so adding a column can't
+        # silently desync the bound-parameter count).
+        assert len(chunk["params"]) == len(_COLUMNS)
 
 
 class TestForwarderBestEffort:
