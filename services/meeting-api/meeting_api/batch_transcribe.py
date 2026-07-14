@@ -7,9 +7,10 @@ whole-meeting pass:
   1. Assemble every audio chunk the bot streamed to MinIO into one blob.
   2. Send it ONCE to transcription-service /v1/transcribe/batch — Deepgram nova-3
      with language='multi' + speaker diarization.
-  3. Map Deepgram's anonymous speaker indices to real participant names using the
-     bot's active-speaker timeline (Google's own speaking indicator — independent
-     of the realtime tile/element vote-lock that mislabeled speakers).
+  3. Name each segment from the bot's active-speaker timeline (Google's own
+     speaking indicator), per segment rather than per Deepgram speaker index —
+     see _attribute_speakers for why the per-index vote collapsed multi-speaker
+     meetings onto whoever talked most.
   4. Replace the meeting's Postgres rows + Cloudflare D1 mirror with the result.
 
 Invoked once per meeting from post_meeting.run_all_tasks(). Idempotent: a second
@@ -17,9 +18,10 @@ run is a no-op unless meeting.data['batch_transcribed'] is cleared.
 """
 from __future__ import annotations
 
+import bisect
 import os
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from sqlalchemy import text as sql_text
@@ -45,50 +47,98 @@ def _service_base_url() -> str:
     return url
 
 
-def _map_speaker_names(
-    segments: List[dict], timeline_samples: List[dict]
-) -> Dict[int, str]:
-    """Vote each Deepgram speaker_index -> participant name via timeline overlap.
+# Progressively widen the window when a segment contains no timeline sample.
+# Samples land every ~500ms, so a short utterance can genuinely straddle two of
+# them; a few seconds of slack recovers it without reaching so far that we
+# borrow a neighbouring speaker's turn.
+_TIMELINE_PAD_MS = (0, 500, 1500, 3000)
 
-    For every diarized segment, the names marked 'speaking' in the timeline
-    samples that fall within the segment's [start,end] window get a vote for that
-    segment's speaker index. The winning name per index is its mapping.
+
+def _votes_in_window(
+    samples: List[dict], ts: List[float], start_ms: float, end_ms: float, pad_ms: float
+) -> Dict[str, float]:
+    """Weighted vote of the names lit in [start-pad, end+pad]."""
+    bucket: Dict[str, float] = {}
+    i = bisect.bisect_left(ts, start_ms - pad_ms)
+    limit = end_ms + pad_ms
+    while i < len(ts) and ts[i] <= limit:
+        speaking = samples[i].get("speaking") or []
+        # When exactly one tile is lit the attribution is unambiguous; split the
+        # vote when several are lit so a clear single speaker still wins.
+        if speaking:
+            weight = 1.0 / len(speaking)
+            for name in speaking:
+                if name:
+                    bucket[name] = bucket.get(name, 0.0) + weight
+        i += 1
+    return bucket
+
+
+def _attribute_speakers(
+    segments: List[dict], timeline_samples: List[dict]
+) -> Tuple[List[Optional[str]], Dict[int, str]]:
+    """Resolve a participant name for each diarized segment.
+
+    Attribution is PER SEGMENT against the active-speaker timeline, not per
+    Deepgram speaker_index; the index is only a fallback for segments the
+    timeline does not cover.
+
+    Why: the timeline is ground truth — Google Meet tells us exactly whose tile
+    is lit — whereas Deepgram's diarization of a single mixed-down, multilingual
+    stream does not cleanly separate voices. Voting per index and taking an
+    independent argmax per index (the previous approach) let the meeting's
+    dominant speaker win nearly every index: in meeting 66 one participant was
+    lit 78% of the time and captured 5 of Deepgram's 6 indices, so ~184 segments
+    actually spoken by three other people were labelled with his name and two
+    participants disappeared from the transcript entirely.
+
+    Returns (per-segment names, index->name map). The map is kept only for the
+    fallback path and for logging.
     """
     if not timeline_samples:
-        return {}
+        return [None] * len(segments), {}
 
-    # Pre-sort samples by time for a simple linear scan per segment.
     samples = sorted(
         (s for s in timeline_samples if s.get("t_ms") is not None),
         key=lambda s: s["t_ms"],
     )
-    votes: Dict[int, Dict[str, float]] = {}
+    ts = [s["t_ms"] for s in samples]
+
+    names: List[Optional[str]] = []
+    index_votes: Dict[int, Dict[str, float]] = {}
+
     for seg in segments:
-        idx = seg.get("speaker_index")
-        if idx is None:
-            continue
         start_ms = float(seg.get("start", 0.0)) * 1000.0
         end_ms = float(seg.get("end", 0.0)) * 1000.0
-        bucket = votes.setdefault(int(idx), {})
-        for s in samples:
-            t = s["t_ms"]
-            if t < start_ms:
-                continue
-            if t > end_ms:
-                break
-            speaking = s.get("speaking") or []
-            # When exactly one tile is speaking the attribution is unambiguous;
-            # split the vote when several are lit so a clear single speaker wins.
-            weight = 1.0 / len(speaking) if speaking else 0.0
-            for name in speaking:
-                if name:
-                    bucket[name] = bucket.get(name, 0.0) + weight
 
-    mapping: Dict[int, str] = {}
-    for idx, bucket in votes.items():
-        if bucket:
-            mapping[idx] = max(bucket, key=bucket.get)
-    return mapping
+        bucket: Dict[str, float] = {}
+        for pad in _TIMELINE_PAD_MS:
+            bucket = _votes_in_window(samples, ts, start_ms, end_ms, pad)
+            if bucket:
+                break
+
+        names.append(max(bucket, key=bucket.get) if bucket else None)
+
+        # Tally the index only from segments the timeline actually covered, so
+        # the fallback below isn't polluted by guesses.
+        idx = seg.get("speaker_index")
+        if idx is not None and bucket:
+            tally = index_votes.setdefault(int(idx), {})
+            for name, w in bucket.items():
+                tally[name] = tally.get(name, 0.0) + w
+
+    index_map: Dict[int, str] = {
+        idx: max(tally, key=tally.get) for idx, tally in index_votes.items() if tally
+    }
+
+    # Fallback: a segment with no timeline coverage inherits its index's name.
+    for i, seg in enumerate(segments):
+        if names[i] is None:
+            idx = seg.get("speaker_index")
+            if idx is not None:
+                names[i] = index_map.get(int(idx))
+
+    return names, index_map
 
 
 async def _call_batch_service(audio_bytes: bytes, fmt: str) -> Optional[dict]:
@@ -152,10 +202,15 @@ async def batch_transcribe_meeting(meeting_id: int, force: bool = False) -> bool
         logger.info(f"batch_transcribe: meeting {meeting_id} produced 0 segments")
         return False
 
-    # 4. Map diarization indices -> names via the active-speaker timeline.
-    speaker_map = _map_speaker_names(segments, timeline)
+    # 4. Attribute a name to each segment via the active-speaker timeline.
+    seg_names, speaker_map = _attribute_speakers(segments, timeline)
     if speaker_map:
-        logger.info(f"batch_transcribe: meeting {meeting_id} speaker map: {speaker_map}")
+        attributed = sum(1 for n in seg_names if n)
+        logger.info(
+            f"batch_transcribe: meeting {meeting_id} attributed {attributed}/{len(segments)} "
+            f"segments to {len(set(n for n in seg_names if n))} speaker(s); "
+            f"index fallback map: {speaker_map}"
+        )
     else:
         logger.warning(f"batch_transcribe: meeting {meeting_id} no speaker timeline; using generic labels")
 
@@ -163,12 +218,9 @@ async def batch_transcribe_meeting(meeting_id: int, force: bool = False) -> bool
     rows = []
     for idx, seg in enumerate(segments):
         spk_idx = seg.get("speaker_index")
-        if spk_idx is not None and spk_idx in speaker_map:
-            speaker_name = speaker_map[spk_idx]
-        elif spk_idx is not None:
+        speaker_name = seg_names[idx]
+        if speaker_name is None and spk_idx is not None:
             speaker_name = f"Speaker {int(spk_idx) + 1}"
-        else:
-            speaker_name = None
         text = (seg.get("text") or "").strip()
         if not text:
             continue
