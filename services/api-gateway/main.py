@@ -483,7 +483,13 @@ async def calendar_meetings_restore_proxy(request: Request):
     url = f"{CALENDAR_SERVICE_URL}/calendar/meetings/restore"
     return await forward_request(app.state.http_client, "POST", url, request, require_auth=False)
 
-# --- Bot Manager Routes --- 
+
+@app.post("/calendar/unsubscribe", tags=["Calendar"], summary="Fully disconnect a client's calendar (server-to-server)")
+async def calendar_unsubscribe_proxy(request: Request):
+    url = f"{CALENDAR_SERVICE_URL}/calendar/unsubscribe"
+    return await forward_request(app.state.http_client, "POST", url, request, require_auth=False)
+
+# --- Bot Manager Routes ---
 @app.post("/bots",
          tags=["Bot Management"],
          summary="Request a new bot to join a meeting",
