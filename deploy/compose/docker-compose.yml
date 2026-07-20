@@ -327,6 +327,13 @@ services:
       - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
       - CF_D1_DATABASE_ID=${CF_D1_DATABASE_ID:-}
       - CF_API_TOKEN=${CF_API_TOKEN:-}
+      - CF_D1_SCHEDULES_TABLE=${CF_D1_SCHEDULES_TABLE:-schedules}
+      - CF_D1_CALENDAR_EVENTS_TABLE=${CF_D1_CALENDAR_EVENTS_TABLE:-calendar_events}
+      # Scheduler loop: polls D1 `schedules` (Worker-owned) ~once a minute and
+      # dispatches due rows to the real bot-launch endpoint on api-gateway.
+      - SCHEDULE_POLL_INTERVAL_SECONDS=${SCHEDULE_POLL_INTERVAL_SECONDS:-60}
+      - SCHEDULER_API_BASE_URL=${SCHEDULER_API_BASE_URL:-http://65.1.101.15.nip.io:8080}
+      - SCHEDULER_MAX_ATTEMPTS=${SCHEDULER_MAX_ATTEMPTS:-3}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     init: true
     depends_on:

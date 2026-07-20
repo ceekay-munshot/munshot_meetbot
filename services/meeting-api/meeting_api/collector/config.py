@@ -50,3 +50,14 @@ CF_D1_MEETINGS_TABLE = os.environ.get("CF_D1_MEETINGS_TABLE", "meetings")
 # Cloudflare frontend can list a meeting for EVERY owner, not just the primary
 # owner_email stamped on transcript rows. See schema_meeting_owners.sql.
 CF_D1_OWNERS_TABLE = os.environ.get("CF_D1_OWNERS_TABLE", "meeting_owners")
+
+# Scheduled-meeting table — owned/auto-created by the Cloudflare Worker side.
+# calendar-service's scheduler loop polls it for due rows and dispatches them;
+# it never alters this table's schema.
+CF_D1_SCHEDULES_TABLE = os.environ.get("CF_D1_SCHEDULES_TABLE", "schedules")
+
+# Calendar-events mirror table — a synced copy of each user's Google Calendar
+# events (Google stays source of truth; calendar-service reconciles this on
+# every sync). Lets GET /calendar/meetings read from D1 instead of Postgres.
+# See deploy/cloudflare-d1/schema_calendar_events.sql.
+CF_D1_CALENDAR_EVENTS_TABLE = os.environ.get("CF_D1_CALENDAR_EVENTS_TABLE", "calendar_events")
