@@ -14,7 +14,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, or_, and_
+from sqlalchemy import select, update
 
 from meeting_api.database import get_db, init_db
 from meeting_api.models import CalendarEvent, Meeting
@@ -26,6 +26,12 @@ from app.sync import (
     MEETING_API_URL,
     BOT_API_TOKEN,
 )
+from app.scheduler import schedule_dispatch_loop
+from meeting_api.collector.d1_calendar_events_forwarder import (
+    mirror_calendar_event_to_d1,
+    query_calendar_events_from_d1,
+)
+from meeting_api.collector.d1_schedule_client import delete_schedules_by_owner
 from app.google_calendar import (
     build_consent_url,
     exchange_code_for_tokens,
@@ -72,6 +78,7 @@ app = FastAPI(
 async def startup():
     await init_db()
     asyncio.create_task(sync_loop())
+    asyncio.create_task(schedule_dispatch_loop())
 
 
 async def sync_loop():
@@ -364,6 +371,10 @@ async def list_client_meetings(
         (status pending → scheduled once a bot is dispatched). Removed events
         (status='cancelled') are excluded unless include_cancelled=true, which
         lets the frontend build a "removed meetings" view to restore from.
+        Read from the Cloudflare D1 mirror (see
+        meeting_api.collector.d1_calendar_events_forwarder) rather than
+        Postgres directly — Postgres CalendarEvent remains the source of
+        truth and is what populates D1 on every sync/remove/restore.
       - meetings: actual bot meetings (Meeting rows). source='calendar' if the
         meeting was auto-dispatched from a calendar event, else 'manual'.
     """
@@ -377,48 +388,24 @@ async def list_client_meetings(
     # Only meetings that WILL happen (or are happening now) — the calendar sync
     # writes future events but never prunes ones that have since passed, so we
     # filter to not-yet-ended here. Prefer end_time; fall back to start_time
-    # when an event has no end.
-    now = datetime.now(timezone.utc)
-    conditions = [
-        CalendarEvent.user_id == user.id,
-        or_(
-            CalendarEvent.end_time >= now,
-            and_(CalendarEvent.end_time.is_(None), CalendarEvent.start_time >= now),
-        ),
-    ]
-    # Hide removed meetings by default; include them (with status='cancelled')
-    # only when the caller explicitly asks — e.g. to offer an "un-remove".
-    if not include_cancelled:
-        conditions.append(CalendarEvent.status != "cancelled")
-
-    ev_result = await db.execute(
-        select(CalendarEvent).where(*conditions).order_by(CalendarEvent.start_time)
-    )
-    events = ev_result.scalars().all()
+    # when an event has no end. Same filtering semantics as the old
+    # Postgres-backed query, now applied inside the D1 SQL itself.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    calendar_events = await query_calendar_events_from_d1(user.email, include_cancelled, now_ms)
+    if calendar_events is None:
+        raise HTTPException(status_code=502, detail="Calendar events store (D1) unavailable")
 
     m_result = await db.execute(
         select(Meeting).where(Meeting.user_id == user.id).order_by(Meeting.created_at.desc())
     )
     meetings = m_result.scalars().all()
 
-    linked_meeting_ids = {e.meeting_id for e in events if e.meeting_id}
+    linked_meeting_ids = {e["meeting_id"] for e in calendar_events if e.get("meeting_id")}
 
     return {
         "email": email,
         "user_id": user.id,
-        "calendar_events": [
-            {
-                "id": e.id,
-                "title": e.title,
-                "start_time": e.start_time.isoformat() if e.start_time else None,
-                "end_time": e.end_time.isoformat() if e.end_time else None,
-                "meeting_url": e.meeting_url,
-                "platform": e.platform,
-                "status": e.status,
-                "meeting_id": e.meeting_id,
-            }
-            for e in events
-        ],
+        "calendar_events": calendar_events,
         "meetings": [
             {
                 "id": m.id,
@@ -512,6 +499,20 @@ async def remove_client_meeting(
     )
     await db.commit()
 
+    # This flips status directly, bypassing sync.py's per-event mirror — keep
+    # D1 reconciled here too (best-effort, never raises).
+    await mirror_calendar_event_to_d1(
+        event_id=event.id,
+        owner_email=user.email,
+        title=event.title,
+        start_time=event.start_time,
+        end_time=event.end_time,
+        meeting_url=event.meeting_url,
+        platform=event.platform,
+        status="cancelled",
+        meeting_id=event.meeting_id,
+    )
+
     return {
         "status": "removed",
         "event_id": event.id,
@@ -572,10 +573,120 @@ async def restore_client_meeting(
     )
     await db.commit()
 
+    # Same reasoning as remove_client_meeting above — mirror the flip to D1.
+    await mirror_calendar_event_to_d1(
+        event_id=event.id,
+        owner_email=user.email,
+        title=event.title,
+        start_time=event.start_time,
+        end_time=event.end_time,
+        meeting_url=event.meeting_url,
+        platform=event.platform,
+        status="pending",
+        meeting_id=event.meeting_id,
+    )
+
     return {
         "status": "restored",
         "event_id": event.id,
         "new_status": "pending",
+    }
+
+
+class CalendarUnsubscribeRequest(BaseModel):
+    email: str
+
+
+@app.post("/calendar/unsubscribe")
+async def unsubscribe_client(
+    body: CalendarUnsubscribeRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fully unsubscribe a client by email (server-to-server): cancel every
+    non-cancelled calendar event (stopping any already-dispatched live bot
+    along the way), remove every D1 `schedules` row they own, and disconnect
+    their Google Calendar. After this call nothing auto-joins on their
+    behalf again until they reconnect their calendar or add a new schedule.
+    """
+    _check_system_key(x_api_key)
+    email = (body.email or "").strip().lower()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    ev_result = await db.execute(
+        select(CalendarEvent).where(
+            CalendarEvent.user_id == user.id,
+            CalendarEvent.status != "cancelled",
+        )
+    )
+    events = ev_result.scalars().all()
+
+    bots_stopped = 0
+    for event in events:
+        # Same stop-then-cancel contract as remove_client_meeting: only a
+        # dispatched ("scheduled") event can have a live bot to stop.
+        if event.meeting_id and event.status == "scheduled" and event.meeting_url and event.platform:
+            try:
+                native_id = _extract_native_id(event.meeting_url, event.platform)
+                headers = {
+                    "X-User-ID": str(event.user_id),
+                    "X-User-Scopes": "bot",
+                    "X-User-Limits": str(getattr(user, "max_concurrent_bots", 1) or 1),
+                }
+                if BOT_API_TOKEN:
+                    headers["X-API-Key"] = BOT_API_TOKEN
+                async with httpx.AsyncClient() as client:
+                    resp = await client.request(
+                        "DELETE",
+                        f"{MEETING_API_URL}/bots/{event.platform}/{native_id}",
+                        headers=headers,
+                        timeout=30,
+                    )
+                if resp.status_code in (200, 202):
+                    bots_stopped += 1
+                else:
+                    logger.warning(
+                        f"Unsubscribe {email}: stop-bot for event {event.id} "
+                        f"returned {resp.status_code}: {resp.text}"
+                    )
+            except Exception as e:
+                logger.error(f"Unsubscribe {email}: failed to stop bot for event {event.id}: {e}")
+
+        await db.execute(
+            update(CalendarEvent).where(CalendarEvent.id == event.id).values(status="cancelled")
+        )
+        await mirror_calendar_event_to_d1(
+            event_id=event.id,
+            owner_email=email,
+            title=event.title,
+            start_time=event.start_time,
+            end_time=event.end_time,
+            meeting_url=event.meeting_url,
+            platform=event.platform,
+            status="cancelled",
+            meeting_id=event.meeting_id,
+        )
+
+    await db.commit()
+
+    schedules_removed = await delete_schedules_by_owner(email)
+
+    user_data = dict(user.data or {})
+    had_calendar = "google_calendar" in user_data
+    user_data.pop("google_calendar", None)
+    await db.execute(update(User).where(User.id == user.id).values(data=user_data))
+    await db.commit()
+
+    return {
+        "status": "unsubscribed",
+        "email": email,
+        "calendar_events_cancelled": len(events),
+        "bots_stopped": bots_stopped,
+        "schedules_removed": schedules_removed,
+        "calendar_disconnected": had_calendar,
     }
 
 

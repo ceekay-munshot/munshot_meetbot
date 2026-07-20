@@ -13,6 +13,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from meeting_api.models import CalendarEvent
 from meeting_api.owners import upsert_meeting_owners
 from meeting_api.collector.d1_owners_forwarder import mirror_meeting_owners_to_d1
+from meeting_api.collector.d1_calendar_events_forwarder import mirror_calendar_event_to_d1
 from admin_models.models import User
 from app.google_calendar import (
     refresh_access_token,
@@ -152,14 +153,38 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
 
         # Skip cancelled events
         if event.get("status") == "cancelled":
-            await db.execute(
+            cancel_result = await db.execute(
                 update(CalendarEvent)
                 .where(
                     CalendarEvent.user_id == user_id,
                     CalendarEvent.external_event_id == event_id,
                 )
                 .values(status="cancelled")
+                .returning(
+                    CalendarEvent.id,
+                    CalendarEvent.title,
+                    CalendarEvent.start_time,
+                    CalendarEvent.end_time,
+                    CalendarEvent.meeting_url,
+                    CalendarEvent.platform,
+                    CalendarEvent.meeting_id,
+                )
             )
+            cancelled_row = cancel_result.first()
+            # No row matched (event was never synced before, e.g. already
+            # cancelled on first sight) — nothing to mirror.
+            if cancelled_row is not None:
+                await mirror_calendar_event_to_d1(
+                    event_id=cancelled_row.id,
+                    owner_email=user.email,
+                    title=cancelled_row.title,
+                    start_time=cancelled_row.start_time,
+                    end_time=cancelled_row.end_time,
+                    meeting_url=cancelled_row.meeting_url,
+                    platform=cancelled_row.platform,
+                    status="cancelled",
+                    meeting_id=cancelled_row.meeting_id,
+                )
             continue
 
         start_time = parse_event_time(event, "start")
@@ -194,9 +219,26 @@ async def sync_user_calendar(user_id: int, db: AsyncSession) -> int:
                 "platform": platform,
                 "attendees": attendees,
             },
-        )
-        await db.execute(stmt)
+        ).returning(CalendarEvent.id, CalendarEvent.status, CalendarEvent.meeting_id)
+        upsert_result = await db.execute(stmt)
         upserted += 1
+
+        upserted_row = upsert_result.first()
+        if upserted_row is not None:
+            await mirror_calendar_event_to_d1(
+                event_id=upserted_row.id,
+                owner_email=user.email,
+                title=event.get("summary", ""),
+                start_time=start_time,
+                end_time=end_time,
+                meeting_url=meeting_url,
+                platform=platform,
+                # status/meeting_id are never touched by this upsert's
+                # on-conflict SET, so the returned values are whatever
+                # schedule_upcoming_bots (or a fresh "pending") last set.
+                status=upserted_row.status,
+                meeting_id=upserted_row.meeting_id,
+            )
 
     # Save new sync token
     if next_sync_token:
@@ -229,16 +271,33 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
     scheduled = 0
 
     for event in events:
+        user_result = await db.execute(select(User).where(User.id == event.user_id))
+        user = user_result.scalar_one_or_none()
+        if not user:
+            continue
+
+        # schedule_upcoming_bots flips CalendarEvent.status directly (bypassing
+        # sync_user_calendar's per-event upsert loop), so mirror it here too —
+        # same reasoning as /calendar/meetings/remove and /restore.
+        async def _mirror(status: str, meeting_id: Optional[int] = None) -> None:
+            await mirror_calendar_event_to_d1(
+                event_id=event.id,
+                owner_email=user.email,
+                title=event.title,
+                start_time=event.start_time,
+                end_time=event.end_time,
+                meeting_url=event.meeting_url,
+                platform=event.platform,
+                status=status,
+                meeting_id=meeting_id,
+            )
+
         # Google-Meet-only fork: skip Zoom/Teams links found on calendars.
         if GOOGLE_MEET_ONLY and event.platform != "google_meet":
             await db.execute(
                 update(CalendarEvent).where(CalendarEvent.id == event.id).values(status="skipped")
             )
-            continue
-
-        user_result = await db.execute(select(User).where(User.id == event.user_id))
-        user = user_result.scalar_one_or_none()
-        if not user:
+            await _mirror("skipped")
             continue
 
         # Respect the user's auto-join preference (default on when unset).
@@ -284,6 +343,7 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
                         meeting_id=meeting_id,
                     )
                 )
+                await _mirror("scheduled", meeting_id)
                 scheduled += 1
                 logger.info(f"Scheduled bot for event {event.id}: {event.title}")
 
@@ -320,6 +380,7 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
                     .where(CalendarEvent.id == event.id)
                     .values(status="scheduled", meeting_id=meeting_id)
                 )
+                await _mirror("scheduled", meeting_id)
                 scheduled += 1
                 logger.info(
                     f"Event {event.id} ({event.title}): meeting {meeting_id} already has an "
@@ -348,6 +409,7 @@ async def schedule_upcoming_bots(db: AsyncSession) -> int:
                     .where(CalendarEvent.id == event.id)
                     .values(status="failed")
                 )
+                await _mirror("failed")
         except Exception as e:
             logger.error(f"Failed to schedule bot for event {event.id}: {e}")
 
