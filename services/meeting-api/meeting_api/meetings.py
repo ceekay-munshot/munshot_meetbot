@@ -159,8 +159,17 @@ async def update_meeting_status(
         # completed meeting (~30 in 90 min in prod logs). Now: log at DEBUG +
         # return True so callers' `if not success` short-circuit doesn't break
         # post-meeting tasks (per the documented race comment in callbacks.py).
-        terminal = {MeetingStatus.COMPLETED, MeetingStatus.FAILED}
-        if current_status == new_status and current_status in terminal:
+        #
+        # #409 — the same benign-duplicate race hits the PRE-meeting lifecycle
+        # callbacks too: the bot occasionally fires 'joining'/'awaiting_admission'
+        # more than once for the same meeting (observed as several near-simultaneous
+        # POSTs, meetings 115/116 in prod). The bot's own callback client (#407)
+        # already assumes duplicates of these statuses are safe to retry and
+        # treats any non-accepted response as a DELIBERATE rejection — so without
+        # this, a harmless duplicate cascades into the bot aborting an otherwise-
+        # successful join. Extend the idempotent no-op to these two self-transitions.
+        idempotent_self = {MeetingStatus.COMPLETED, MeetingStatus.FAILED, MeetingStatus.JOINING, MeetingStatus.AWAITING_ADMISSION}
+        if current_status == new_status and current_status in idempotent_self:
             logger.debug(
                 f"Idempotent re-fire of '{current_status.value}' for meeting {meeting.id} "
                 f"(documented race; benign no-op; see callbacks.py:217)"
