@@ -73,7 +73,6 @@ ROUTE_SCOPES = {
     "/b/": {"browser"},
     "/transcripts": {"tx"},
     "/meetings": {"tx"},
-    "/audio": {"tx"},
 }
 
 # --- Validation at startup ---
@@ -1100,18 +1099,34 @@ async def get_transcript_proxy(platform: Platform, native_meeting_id: str, reque
     url = f"{TRANSCRIPTION_COLLECTOR_URL}/transcripts/{platform.value}/{native_meeting_id}"
     return await forward_request(app.state.http_client, "GET", url, request)
 
-@app.get("/audio/{meeting_id}",
-        tags=["Transcriptions"],
-        summary="Get recorded audio for a specific meeting",
+@app.get("/public/audio/{meeting_id}",
+        tags=["Public"],
+        summary="Get recorded audio for a specific meeting (server-to-server)",
         description="Retrieves the assembled recording for a meeting specified by our own database ID — "
                     "NOT (platform, native_meeting_id), since recurring meetings reuse the same native ID "
-                    "across every occurrence. Audio is retained for a limited time (see AUDIO_RETENTION_DAYS) "
-                    "after which this 404s.",
-        dependencies=[Depends(api_key_scheme)])
-async def get_audio_proxy(meeting_id: int, request: Request):
-    """Forward request to Transcription Collector to get recorded audio."""
-    url = f"{TRANSCRIPTION_COLLECTOR_URL}/audio/{meeting_id}"
-    return await forward_request(app.state.http_client, "GET", url, request)
+                    "across every occurrence. Requires the system key in X-API-Key (this is a trusted "
+                    "server-to-server endpoint for a BFF like the Cloudflare Worker frontend, not for direct "
+                    "browser/client use — same trust model as /public/join). Audio is retained for a limited "
+                    "time (see AUDIO_RETENTION_DAYS) after which this 404s.")
+async def get_audio_proxy(meeting_id: int, x_api_key: Optional[str] = Depends(api_key_scheme)):
+    # Auth: trusted server-to-server only — caller must present the system key.
+    # No per-user API key exists for a BFF to present on a resolved user's
+    # behalf here (unlike a real end-user token flow); the Worker's own D1
+    # data is what scopes which meeting_id belongs to which of its users.
+    if not PUBLIC_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="Endpoint not configured (PUBLIC_BOT_API_KEY unset)")
+    if not x_api_key or not hmac.compare_digest(x_api_key, PUBLIC_BOT_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing system API key")
+
+    internal_secret = os.getenv("INTERNAL_API_SECRET", "")
+    headers = {"X-Internal-Secret": internal_secret} if internal_secret else {}
+    try:
+        resp = await app.state.http_client.get(
+            f"{TRANSCRIPTION_COLLECTOR_URL}/internal/audio/{meeting_id}", headers=headers,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
 
 
 # --- Public Transcript Share Links (no API integration needed by client) ---
