@@ -256,34 +256,26 @@ async def get_transcript_by_native_id(
     return TranscriptionResponse(**response_data)
 
 
-@router.get("/audio/{platform}/{native_meeting_id}",
-            summary="Get recorded audio for a specific meeting by platform and native ID",
+@router.get("/audio/{meeting_id}",
+            summary="Get recorded audio for a specific meeting by its database ID",
             dependencies=[Depends(get_current_user)])
-async def get_audio_by_native_id(
-    platform: Platform,
-    native_meeting_id: str,
-    meeting_id: Optional[int] = Query(None, description="Optional specific database meeting ID."),
+async def get_audio_by_meeting_id(
+    meeting_id: int,
     current_user: UserProxy = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Streams back the assembled recording for a meeting specified by its platform and native ID.
+    """Streams back the assembled recording for a meeting, looked up by our own
+    database id — NOT by (platform, native_meeting_id). Recurring meetings reuse
+    the same native_meeting_id across every occurrence, so that pair can't
+    identify a single meeting; the internal id is the only unambiguous key.
 
     Audio is only retained for AUDIO_RETENTION_DAYS (see sweeps.py); once purged
     this 404s with a message distinguishing "never recorded" from "expired".
     """
-    if meeting_id is not None:
-        stmt_meeting = select(Meeting).where(
-            Meeting.id == meeting_id,
-            Meeting.user_id == current_user.id,
-            Meeting.platform == platform.value,
-            Meeting.platform_specific_id == native_meeting_id
-        )
-    else:
-        stmt_meeting = select(Meeting).where(
-            Meeting.user_id == current_user.id,
-            Meeting.platform == platform.value,
-            Meeting.platform_specific_id == native_meeting_id
-        ).order_by(Meeting.created_at.desc())
+    stmt_meeting = select(Meeting).where(
+        Meeting.id == meeting_id,
+        Meeting.user_id == current_user.id,
+    )
 
     result_meeting = await db.execute(stmt_meeting)
     meeting = result_meeting.scalars().first()
@@ -291,7 +283,7 @@ async def get_audio_by_native_id(
     if not meeting:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Meeting not found for platform {platform.value} and ID {native_meeting_id}"
+            detail=f"Meeting not found: {meeting_id}"
         )
 
     rec = (meeting.data or {}).get("recording") or {}

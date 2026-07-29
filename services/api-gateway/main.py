@@ -1100,15 +1100,17 @@ async def get_transcript_proxy(platform: Platform, native_meeting_id: str, reque
     url = f"{TRANSCRIPTION_COLLECTOR_URL}/transcripts/{platform.value}/{native_meeting_id}"
     return await forward_request(app.state.http_client, "GET", url, request)
 
-@app.get("/audio/{platform}/{native_meeting_id}",
+@app.get("/audio/{meeting_id}",
         tags=["Transcriptions"],
         summary="Get recorded audio for a specific meeting",
-        description="Retrieves the assembled recording for a meeting specified by its platform and native ID. "
-                    "Audio is retained for a limited time (see AUDIO_RETENTION_DAYS) after which this 404s.",
+        description="Retrieves the assembled recording for a meeting specified by our own database ID — "
+                    "NOT (platform, native_meeting_id), since recurring meetings reuse the same native ID "
+                    "across every occurrence. Audio is retained for a limited time (see AUDIO_RETENTION_DAYS) "
+                    "after which this 404s.",
         dependencies=[Depends(api_key_scheme)])
-async def get_audio_proxy(platform: Platform, native_meeting_id: str, request: Request):
+async def get_audio_proxy(meeting_id: int, request: Request):
     """Forward request to Transcription Collector to get recorded audio."""
-    url = f"{TRANSCRIPTION_COLLECTOR_URL}/audio/{platform.value}/{native_meeting_id}"
+    url = f"{TRANSCRIPTION_COLLECTOR_URL}/audio/{meeting_id}"
     return await forward_request(app.state.http_client, "GET", url, request)
 
 
