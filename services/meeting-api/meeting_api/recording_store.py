@@ -133,3 +133,24 @@ async def assemble_meeting_audio(
     empty bytes when nothing was recorded.
     """
     return await asyncio.to_thread(_assemble_sync, meeting_id, session_uid)
+
+
+def _delete_meeting_audio_sync(meeting_id: int) -> int:
+    s3 = _client()
+    bucket = _bucket()
+    prefix = _prefix(meeting_id)
+    deleted = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = page.get("Contents", []) or []
+        if not objects:
+            continue
+        delete_keys = [{"Key": obj["Key"]} for obj in objects]
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": delete_keys})
+        deleted += len(delete_keys)
+    return deleted
+
+
+async def delete_meeting_audio(meeting_id: int) -> int:
+    """Delete every stored chunk for a meeting (all sessions). Returns count deleted."""
+    return await asyncio.to_thread(_delete_meeting_audio_sync, meeting_id)

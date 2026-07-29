@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import select, and_, func, distinct, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ import redis.asyncio as aioredis
 
 from ..database import get_db, async_session_local
 from ..models import Meeting, Transcription, MeetingSession
+from .. import recording_store
 from ..schemas import (
     MeetingResponse,
     MeetingListResponse,
@@ -253,6 +254,67 @@ async def get_transcript_by_native_id(
     response_data["speaker_events"] = (meeting.data or {}).get("speaker_events", []) if isinstance(meeting.data, dict) else []
     response_data["segments"] = sorted_segments
     return TranscriptionResponse(**response_data)
+
+
+@router.get("/audio/{platform}/{native_meeting_id}",
+            summary="Get recorded audio for a specific meeting by platform and native ID",
+            dependencies=[Depends(get_current_user)])
+async def get_audio_by_native_id(
+    platform: Platform,
+    native_meeting_id: str,
+    meeting_id: Optional[int] = Query(None, description="Optional specific database meeting ID."),
+    current_user: UserProxy = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Streams back the assembled recording for a meeting specified by its platform and native ID.
+
+    Audio is only retained for AUDIO_RETENTION_DAYS (see sweeps.py); once purged
+    this 404s with a message distinguishing "never recorded" from "expired".
+    """
+    if meeting_id is not None:
+        stmt_meeting = select(Meeting).where(
+            Meeting.id == meeting_id,
+            Meeting.user_id == current_user.id,
+            Meeting.platform == platform.value,
+            Meeting.platform_specific_id == native_meeting_id
+        )
+    else:
+        stmt_meeting = select(Meeting).where(
+            Meeting.user_id == current_user.id,
+            Meeting.platform == platform.value,
+            Meeting.platform_specific_id == native_meeting_id
+        ).order_by(Meeting.created_at.desc())
+
+    result_meeting = await db.execute(stmt_meeting)
+    meeting = result_meeting.scalars().first()
+
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting not found for platform {platform.value} and ID {native_meeting_id}"
+        )
+
+    rec = (meeting.data or {}).get("recording") or {}
+    if rec.get("audio_deleted_at"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Audio for this meeting was deleted per retention policy at {rec['audio_deleted_at']}"
+        )
+
+    session_uid = rec.get("session_uid")
+    audio_bytes, fmt, n_chunks = await recording_store.assemble_meeting_audio(meeting.id, session_uid)
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No recorded audio found for this meeting"
+        )
+
+    logger.info(f"[API Meet {meeting.id}] Serving assembled audio: {len(audio_bytes)} bytes from {n_chunks} chunk(s)")
+    return Response(
+        content=audio_bytes,
+        media_type=f"audio/{fmt or 'webm'}",
+        headers={"Content-Disposition": f'attachment; filename="meeting_{meeting.id}.{fmt or "webm"}"'},
+    )
 
 
 @router.post("/ws/authorize-subscribe",

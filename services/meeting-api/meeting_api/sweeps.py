@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from .models import Meeting
 from .schemas import MeetingStatus, MeetingCompletionReason
@@ -286,6 +288,78 @@ async def _sweep_aggregation_retry(
     return swept
 
 
+# Audio-retention sweep config. Raw MinIO recording chunks are only needed
+# long enough for batch_transcribe.py to assemble + transcribe them once;
+# after that they just cost storage, so purge them AUDIO_RETENTION_DAYS after
+# the meeting was created. Checked on its own (slow) cadence — the query is
+# cheap when there's nothing to do, but there's no reason to hit MinIO's
+# list/delete API every 60s like the other sweeps.
+AUDIO_RETENTION_DAYS = float(os.getenv("AUDIO_RETENTION_DAYS", "7"))
+AUDIO_RETENTION_POLL_INTERVAL = 3600  # check hourly
+
+_last_audio_retention_sweep_at: float = 0.0
+
+
+async def _sweep_audio_retention(
+    db_session_factory: Callable[[], AsyncSession],
+) -> int:
+    """Delete MinIO audio chunks for finalized meetings older than AUDIO_RETENTION_DAYS.
+
+    Marks `data.recording.audio_deleted_at` on success so the /audio endpoint
+    can tell "expired" apart from "never recorded", and so a later iteration
+    doesn't re-scan a meeting it already purged.
+    """
+    from . import recording_store
+
+    threshold = datetime.utcnow() - timedelta(days=AUDIO_RETENTION_DAYS)
+    swept = 0
+
+    async with db_session_factory() as db:
+        stmt = text("""
+            SELECT id FROM meetings
+            WHERE data->'recording' IS NOT NULL
+              AND data->'recording'->>'audio_deleted_at' IS NULL
+              AND status IN (:completed, :failed)
+              AND created_at < :threshold
+            LIMIT 200
+        """)
+        rows = (await db.execute(stmt, {
+            "completed": MeetingStatus.COMPLETED.value,
+            "failed": MeetingStatus.FAILED.value,
+            "threshold": threshold,
+        })).fetchall()
+
+        for row in rows:
+            meeting_id = row[0]
+            try:
+                deleted = await recording_store.delete_meeting_audio(meeting_id)
+            except Exception as e:
+                logger.error(
+                    f"[sweep] audio-retention: failed to delete MinIO audio for meeting {meeting_id}: {e}",
+                    exc_info=True,
+                )
+                continue
+
+            meeting = await db.get(Meeting, meeting_id)
+            if not meeting:
+                continue
+            data_obj = dict(meeting.data or {})
+            rec = dict(data_obj.get("recording") or {})
+            rec["audio_deleted_at"] = datetime.utcnow().isoformat() + "Z"
+            rec["audio_chunks_deleted"] = deleted
+            data_obj["recording"] = rec
+            meeting.data = data_obj
+            flag_modified(meeting, "data")
+            await db.commit()
+            swept += 1
+            logger.info(
+                f"[sweep] audio-retention: purged {deleted} chunk(s) for meeting {meeting_id} "
+                f"(older than {AUDIO_RETENTION_DAYS}d)"
+            )
+
+    return swept
+
+
 async def _sweep_container_stops() -> dict:
     """v0.10.5 Pack D.2 (#266) — durable container-stop outbox consumer.
 
@@ -328,10 +402,10 @@ async def start_sweeps(
     Pattern mirrors webhook_retry_worker.start_retry_worker — same
     shape, different responsibility.
     """
-    global _stop_event, sweep_iterations, sweep_last_iteration_at
+    global _stop_event, sweep_iterations, sweep_last_iteration_at, _last_audio_retention_sweep_at
     _stop_event = asyncio.Event()
 
-    logger.info("[sweeps] Starting meeting-api idle sweeps loop (Pack E.3.2 + H.4 + D.2)")
+    logger.info("[sweeps] Starting meeting-api idle sweeps loop (Pack E.3.2 + H.4 + D.2 + audio-retention)")
 
     while not _stop_event.is_set():
         sweep_iterations += 1
@@ -357,6 +431,18 @@ async def start_sweeps(
                 )
         except Exception as e:
             logger.error(f"[sweeps] iteration {sweep_iterations} aggregation-retry error: {e}", exc_info=True)
+
+        if time.time() - _last_audio_retention_sweep_at >= AUDIO_RETENTION_POLL_INTERVAL:
+            _last_audio_retention_sweep_at = time.time()
+            try:
+                purged = await _sweep_audio_retention(db_session_factory)
+                if purged > 0:
+                    logger.info(
+                        f"[sweeps] iteration {sweep_iterations}: "
+                        f"purged audio for {purged} meeting(s) past the {AUDIO_RETENTION_DAYS}d retention window"
+                    )
+            except Exception as e:
+                logger.error(f"[sweeps] iteration {sweep_iterations} audio-retention error: {e}", exc_info=True)
 
         try:
             stop_summary = await _sweep_container_stops()
