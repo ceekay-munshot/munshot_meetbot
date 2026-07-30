@@ -303,24 +303,43 @@ _last_audio_retention_sweep_at: float = 0.0
 async def _sweep_audio_retention(
     db_session_factory: Callable[[], AsyncSession],
 ) -> int:
-    """Delete MinIO audio chunks for finalized meetings older than AUDIO_RETENTION_DAYS.
+    """Purge stored media for finalized meetings older than AUDIO_RETENTION_DAYS.
 
-    Marks `data.recording.audio_deleted_at` on success so the /audio endpoint
-    can tell "expired" apart from "never recorded", and so a later iteration
-    doesn't re-scan a meeting it already purged.
+    Removes the meeting's MinIO audio chunks and its failure-diagnostic
+    screenshots, and drops the active-speaker timeline from `data` (it only
+    describes audio that no longer exists, and it is by far the largest JSONB
+    key — ~2 samples/second for the whole meeting).
+
+    Marks one of two keys so a later iteration doesn't re-scan the meeting:
+      - `data.recording.audio_deleted_at`         — media was actually deleted
+      - `data.recording.audio_retention_checked_at` — nothing was stored
+    They stay distinct because /audio reports "expired per retention policy" off
+    the former; marking it on a meeting that never recorded would lie.
+
+    The candidate query deliberately does NOT require `data->'recording'` to
+    exist. It used to, and that made this sweep dead code for its entire life:
+    `data.recording` is only written when a chunk arrives with is_final=true, and
+    the bot dropped that chunk whenever it was zero-length (fixed in
+    vexa-bot audio-pipeline `_handleChunk`), so the key was absent on 100% of
+    meetings and this WHERE clause matched 0 rows while audio accumulated
+    indefinitely. The retention guarantee must not depend on a bot-side success
+    signal — a meeting whose bot crashed is exactly the one whose audio needs
+    collecting. `->>` on a missing key yields NULL, so absent-key rows qualify.
     """
     from . import recording_store
 
     threshold = datetime.utcnow() - timedelta(days=AUDIO_RETENTION_DAYS)
-    swept = 0
+    swept = 0      # meetings whose media we actually deleted
+    checked = 0    # meetings marked as having nothing stored
 
     async with db_session_factory() as db:
         stmt = text("""
             SELECT id FROM meetings
-            WHERE data->'recording' IS NOT NULL
-              AND data->'recording'->>'audio_deleted_at' IS NULL
-              AND status IN (:completed, :failed)
+            WHERE status IN (:completed, :failed)
               AND created_at < :threshold
+              AND data->'recording'->>'audio_deleted_at' IS NULL
+              AND data->'recording'->>'audio_retention_checked_at' IS NULL
+            ORDER BY created_at
             LIMIT 200
         """)
         rows = (await db.execute(stmt, {
@@ -333,9 +352,10 @@ async def _sweep_audio_retention(
             meeting_id = row[0]
             try:
                 deleted = await recording_store.delete_meeting_audio(meeting_id)
+                shots = await recording_store.delete_meeting_screenshots(meeting_id)
             except Exception as e:
                 logger.error(
-                    f"[sweep] audio-retention: failed to delete MinIO audio for meeting {meeting_id}: {e}",
+                    f"[sweep] audio-retention: failed to delete stored media for meeting {meeting_id}: {e}",
                     exc_info=True,
                 )
                 continue
@@ -345,18 +365,40 @@ async def _sweep_audio_retention(
                 continue
             data_obj = dict(meeting.data or {})
             rec = dict(data_obj.get("recording") or {})
-            rec["audio_deleted_at"] = datetime.utcnow().isoformat() + "Z"
-            rec["audio_chunks_deleted"] = deleted
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            if deleted:
+                rec["audio_deleted_at"] = now_iso
+                rec["audio_chunks_deleted"] = deleted
+                # The timeline maps diarized segments onto audio we just deleted;
+                # keep the count for forensics, drop the samples.
+                timeline = data_obj.get("speaker_timeline")
+                if isinstance(timeline, dict) and timeline.get("samples"):
+                    timeline = dict(timeline)
+                    timeline["samples_pruned"] = len(timeline["samples"])
+                    timeline["samples"] = []
+                    timeline["pruned_at"] = now_iso
+                    data_obj["speaker_timeline"] = timeline
+            else:
+                rec["audio_retention_checked_at"] = now_iso
+            if shots:
+                rec["screenshots_deleted"] = shots
             data_obj["recording"] = rec
             meeting.data = data_obj
             flag_modified(meeting, "data")
             await db.commit()
-            swept += 1
-            logger.info(
-                f"[sweep] audio-retention: purged {deleted} chunk(s) for meeting {meeting_id} "
-                f"(older than {AUDIO_RETENTION_DAYS}d)"
-            )
+            if deleted or shots:
+                swept += 1
+                logger.info(
+                    f"[sweep] audio-retention: purged {deleted} chunk(s) + {shots} screenshot(s) "
+                    f"for meeting {meeting_id} (older than {AUDIO_RETENTION_DAYS}d)"
+                )
+            else:
+                checked += 1
 
+    if checked:
+        logger.debug(
+            f"[sweep] audio-retention: {checked} meeting(s) past retention had no stored media"
+        )
     return swept
 
 
