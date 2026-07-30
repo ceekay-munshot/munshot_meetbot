@@ -30,6 +30,7 @@ from .meetings import router as meetings_router, set_redis
 from .callbacks import router as callbacks_router
 from .voice_agent import router as voice_agent_router
 from .recordings import router as recordings_router
+from .youtube import router as youtube_router
 
 # Collector imports
 from .collector.config import (
@@ -84,6 +85,7 @@ app.include_router(callbacks_router)
 app.include_router(voice_agent_router)
 app.include_router(collector_router)
 app.include_router(recordings_router)
+app.include_router(youtube_router)
 
 # Collector background task references
 _collector_tasks: list = []

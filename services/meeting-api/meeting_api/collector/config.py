@@ -61,3 +61,12 @@ CF_D1_SCHEDULES_TABLE = os.environ.get("CF_D1_SCHEDULES_TABLE", "schedules")
 # every sync). Lets GET /calendar/meetings read from D1 instead of Postgres.
 # See deploy/cloudflare-d1/schema_calendar_events.sql.
 CF_D1_CALENDAR_EVENTS_TABLE = os.environ.get("CF_D1_CALENDAR_EVENTS_TABLE", "calendar_events")
+
+# YouTube transcript mirror — a metadata row per video plus its timed segments,
+# both carrying owner_email so the frontend can filter per client. Kept in their
+# own tables (not `meetings`/`transcriptions`) because a video has no bot,
+# session or participants. See deploy/cloudflare-d1/schema_youtube_transcripts.sql.
+CF_D1_YOUTUBE_TABLE = os.environ.get("CF_D1_YOUTUBE_TABLE", "youtube_transcripts")
+CF_D1_YOUTUBE_SEGMENTS_TABLE = os.environ.get(
+    "CF_D1_YOUTUBE_SEGMENTS_TABLE", "youtube_transcript_segments"
+)
