@@ -16,6 +16,18 @@ function parseAIModel(): { provider: string; model: string } | null {
 }
 
 export async function GET() {
+  // LLM_PROVIDER=claude routes /api/ai/chat to Claude via AWS Bedrock
+  // instead of the AI_MODEL-configured provider; see route.ts's getModel().
+  if ((process.env.LLM_PROVIDER || "openai").toLowerCase() === "claude") {
+    return NextResponse.json({
+      enabled: true,
+      provider: "claude",
+      model: process.env.BEDROCK_CLAUDE_MODEL_ID || null,
+      hasApiKey: !!process.env.BEDROCK_CLAUDE_API_KEY,
+      hasBaseUrl: false,
+    });
+  }
+
   const config = parseAIModel();
 
   if (!config) {

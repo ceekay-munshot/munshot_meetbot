@@ -1,6 +1,7 @@
 import { streamText } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createBedrockClaude } from "@/lib/bedrock-claude-provider";
 
 export const runtime = "nodejs";
 
@@ -17,7 +18,24 @@ function parseAIModel(): { provider: string; model: string } | null {
   return { provider: provider.toLowerCase(), model };
 }
 
+// LLM_PROVIDER is a standalone toggle, independent of AI_MODEL, that swaps
+// this endpoint's model to Claude via AWS Bedrock. It defaults to "openai"
+// so existing deployments are unaffected unless someone explicitly sets
+// LLM_PROVIDER=claude. See src/lib/bedrock-claude-provider.ts — that file
+// plus this branch are the entire Claude/Bedrock path and can be removed
+// together without touching anything below.
 function getModel() {
+  const llmProvider = (process.env.LLM_PROVIDER || "openai").toLowerCase();
+  if (llmProvider === "claude") {
+    const apiKey = process.env.BEDROCK_CLAUDE_API_KEY;
+    if (!apiKey) throw new Error("BEDROCK_CLAUDE_API_KEY is required when LLM_PROVIDER=claude");
+    return createBedrockClaude({
+      apiKey,
+      modelId: process.env.BEDROCK_CLAUDE_MODEL_ID,
+      region: process.env.BEDROCK_CLAUDE_REGION,
+    });
+  }
+
   const config = parseAIModel();
   if (!config) {
     throw new Error("AI not configured. Set AI_MODEL environment variable.");
@@ -178,7 +196,8 @@ function convertMessages(messages: UIMessage[]): Array<{ role: "user" | "assista
 export async function POST(request: Request) {
   try {
     // Check if AI is configured
-    if (!process.env.AI_MODEL) {
+    const usingBedrockClaude = (process.env.LLM_PROVIDER || "openai").toLowerCase() === "claude";
+    if (!usingBedrockClaude && !process.env.AI_MODEL) {
       return new Response(JSON.stringify({ error: "AI is not configured on this instance" }), {
         status: 503,
         headers: { "Content-Type": "application/json" },
