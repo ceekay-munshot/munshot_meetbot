@@ -52,6 +52,15 @@ export interface MeetingData {
   completion_reason?: string;
   // Status history
   status_transition?: StatusTransition[];
+  // Recording bookkeeping written by meeting-api (chunk upload + retention sweep)
+  recording?: {
+    session_uid?: string;
+    /** Set by the retention sweep once the raw audio chunks were deleted. */
+    audio_deleted_at?: string;
+    /** Set by the sweep when it found nothing stored to delete. */
+    audio_retention_checked_at?: string;
+    [key: string]: unknown;
+  };
   [key: string]: unknown;
 }
 
