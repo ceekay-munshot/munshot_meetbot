@@ -1,20 +1,20 @@
 import { describe, it, expect } from "vitest";
 import {
-  audioEndpointPath,
   canHaveRecording,
-  classifyAudioResponse,
+  classifyRecordingFailure,
   extensionForContentType,
   formatBytes,
-  parseTotalBytes,
-  probeMeetingAudio,
+  knownRecordingState,
+  loadMeetingRecording,
+  recordingEndpointPath,
   recordingFilename,
 } from "@/lib/recording";
 import type { Meeting } from "@/types/vexa";
 
 const meeting: Meeting = {
-  id: "42",
+  id: "126",
   platform: "google_meet",
-  platform_specific_id: "abc-defg-hij",
+  platform_specific_id: "toq-xnph-evg",
   status: "completed",
   start_time: "2026-08-05T09:30:00Z",
   end_time: "2026-08-05T10:15:00Z",
@@ -23,89 +23,107 @@ const meeting: Meeting = {
   created_at: "2026-08-05T09:29:00Z",
 };
 
-describe("audioEndpointPath", () => {
-  it("targets the proxied /audio/{platform}/{native_meeting_id} route", () => {
-    expect(audioEndpointPath("google_meet", "abc-defg-hij")).toBe(
-      "/api/vexa/audio/google_meet/abc-defg-hij"
-    );
-  });
-
-  it("escapes meeting ids that are not URL-safe", () => {
-    expect(audioEndpointPath("zoom", "123 456/789")).toBe(
-      "/api/vexa/audio/zoom/123%20456%2F789"
-    );
+describe("recordingEndpointPath", () => {
+  it("targets the dashboard's own recording route, keyed by internal meeting id", () => {
+    // Keyed by our database id, not (platform, native_meeting_id) — recurring
+    // meetings reuse the same Meet code across every occurrence.
+    expect(recordingEndpointPath(126)).toBe("/api/recordings/126");
+    expect(recordingEndpointPath("126")).toBe("/api/recordings/126");
   });
 });
 
-describe("classifyAudioResponse", () => {
-  it("treats 2xx as playable", () => {
-    expect(classifyAudioResponse(200, "")).toEqual({ state: "available" });
-    expect(classifyAudioResponse(206, "")).toEqual({ state: "available" });
-  });
-
+describe("classifyRecordingFailure", () => {
   it("separates a retention-policy delete from a meeting that was never recorded", () => {
-    // The API answers 404 for both; only the wording tells them apart.
+    // meeting-api answers 404 for both; only the wording tells them apart.
     expect(
-      classifyAudioResponse(404, JSON.stringify({ detail: "Recording deleted per retention policy" }))
+      classifyRecordingFailure(
+        404,
+        JSON.stringify({ detail: "Audio for this meeting was deleted per retention policy at 2026-08-01T00:00:00Z" })
+      )
     ).toEqual({
       state: "unavailable",
       reason: "deleted",
-      message: "Recording deleted per retention policy",
+      message: "Audio for this meeting was deleted per retention policy at 2026-08-01T00:00:00Z",
     });
 
-    expect(classifyAudioResponse(404, JSON.stringify({ detail: "No recorded audio found" }))).toEqual({
+    expect(
+      classifyRecordingFailure(404, JSON.stringify({ detail: "No recorded audio found for this meeting" }))
+    ).toEqual({
       state: "unavailable",
       reason: "never_recorded",
-      message: "No recorded audio found",
+      message: "No recorded audio found for this meeting",
+    });
+  });
+
+  it("treats an unknown meeting id as nothing recorded, not as an error", () => {
+    const result = classifyRecordingFailure(404, JSON.stringify({ detail: "Meeting not found: 999" }));
+    expect(result).toEqual({
+      state: "unavailable",
+      reason: "never_recorded",
+      message: "Meeting not found: 999",
     });
   });
 
   it("still classifies a 404 with an empty body", () => {
-    const result = classifyAudioResponse(404, "");
-    expect(result).toEqual({
+    expect(classifyRecordingFailure(404, "")).toEqual({
       state: "unavailable",
       reason: "never_recorded",
-      message: "No recording available for this meeting.",
+      message: "No recorded audio found for this meeting.",
     });
   });
 
   it("surfaces auth failures as errors, not as a missing recording", () => {
-    const result = classifyAudioResponse(401, JSON.stringify({ error: "Not authenticated" }));
-    expect(result).toEqual({ state: "error", message: "Not authenticated" });
+    expect(classifyRecordingFailure(403, JSON.stringify({ detail: "Not authorized to access this meeting" }))).toEqual({
+      state: "error",
+      message: "Not authorized to access this meeting",
+    });
+  });
+
+  it("explains a timeout — assembly is slow for long meetings", () => {
+    expect(classifyRecordingFailure(504, JSON.stringify({ detail: "Timed out assembling the recording" }))).toEqual({
+      state: "error",
+      message: "Timed out assembling the recording",
+    });
+    expect(classifyRecordingFailure(504, "")).toEqual({
+      state: "error",
+      message: "Timed out assembling the recording. Try again in a moment.",
+    });
   });
 
   it("falls back to the raw body when the error is not JSON", () => {
-    expect(classifyAudioResponse(500, "upstream exploded")).toEqual({
+    expect(classifyRecordingFailure(500, "upstream exploded")).toEqual({
       state: "error",
       message: "upstream exploded",
     });
   });
 
   it("reports the status code when there is no body at all", () => {
-    expect(classifyAudioResponse(502, "")).toEqual({
+    expect(classifyRecordingFailure(502, "")).toEqual({
       state: "error",
       message: "Could not load the recording (HTTP 502).",
     });
   });
 });
 
-describe("parseTotalBytes", () => {
-  it("reads the total out of a Content-Range", () => {
-    expect(parseTotalBytes("bytes 0-0/1048576", "1")).toBe(1048576);
+describe("knownRecordingState", () => {
+  it("reports an expired recording from meeting data, with no request", () => {
+    const expired: Meeting = {
+      ...meeting,
+      data: { recording: { session_uid: "abc", audio_deleted_at: "2026-08-01T03:00:00Z" } },
+    };
+    expect(knownRecordingState(expired)).toEqual({
+      state: "unavailable",
+      reason: "deleted",
+      message: "Audio was deleted per retention policy on 1 Aug 2026.",
+    });
   });
 
-  it("ignores Content-Length when the response is a range slice", () => {
-    // Content-Length is 1 here — the length of the probe slice, not the file.
-    expect(parseTotalBytes("bytes 0-0/*", "1")).toBeNull();
-  });
-
-  it("uses Content-Length for a full (non-ranged) response", () => {
-    expect(parseTotalBytes(null, "2048")).toBe(2048);
-  });
-
-  it("returns null when the server reports nothing usable", () => {
-    expect(parseTotalBytes(null, null)).toBeNull();
-    expect(parseTotalBytes(null, "not-a-number")).toBeNull();
+  it("stays silent when nothing is known — absent recording data does not prove absent audio", () => {
+    // data.recording is only written when a chunk arrives flagged final, so its
+    // absence is not evidence either way.
+    expect(knownRecordingState(meeting)).toBeNull();
+    expect(knownRecordingState({ ...meeting, data: { recording: { session_uid: "abc" } } })).toBeNull();
+    expect(knownRecordingState(null)).toBeNull();
   });
 });
 
@@ -126,11 +144,11 @@ describe("extensionForContentType", () => {
 
 describe("recordingFilename", () => {
   it("names the file after the meeting date and id", () => {
-    expect(recordingFilename(meeting, "audio/webm")).toBe("recording-2026-08-05-abc-defg-hij.webm");
+    expect(recordingFilename(meeting, "audio/webm")).toBe("recording-2026-08-05-toq-xnph-evg.webm");
   });
 
   it("keeps the extension in step with the served content type", () => {
-    expect(recordingFilename(meeting, "audio/mpeg")).toBe("recording-2026-08-05-abc-defg-hij.mp3");
+    expect(recordingFilename(meeting, "audio/mpeg")).toBe("recording-2026-08-05-toq-xnph-evg.mp3");
   });
 });
 
@@ -148,7 +166,7 @@ describe("formatBytes", () => {
 });
 
 describe("canHaveRecording", () => {
-  it("only looks for audio once the bot could have captured some", () => {
+  it("only offers audio once the bot could have captured some", () => {
     expect(canHaveRecording("completed")).toBe(true);
     expect(canHaveRecording("active")).toBe(true);
     expect(canHaveRecording("stopping")).toBe(true);
@@ -159,61 +177,67 @@ describe("canHaveRecording", () => {
   });
 });
 
-describe("probeMeetingAudio", () => {
+describe("loadMeetingRecording", () => {
   function stubFetch(response: Response | Error) {
-    const calls: Array<{ url: string; init?: RequestInit }> = [];
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
-      calls.push({ url, init });
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string) => {
+      calls.push(url);
       if (response instanceof Error) throw response;
       return response;
     }) as unknown as typeof fetch;
     return calls;
   }
 
-  it("range-requests a single byte and reports the full size", async () => {
+  const objectUrls: string[] = [];
+  globalThis.URL.createObjectURL = ((blob: Blob) => {
+    objectUrls.push(blob.type);
+    return `blob:mock/${objectUrls.length}`;
+  }) as typeof URL.createObjectURL;
+
+  it("returns a playable object URL plus the real byte size", async () => {
     const calls = stubFetch(
-      new Response("x", {
-        status: 206,
-        headers: {
-          "content-type": "audio/webm",
-          "content-range": "bytes 0-0/5242880",
-          "content-length": "1",
-        },
+      new Response(new Blob([new Uint8Array(2048)], { type: "audio/webm" }), {
+        status: 200,
+        headers: { "content-type": "audio/webm" },
       })
     );
 
-    const probe = await probeMeetingAudio("google_meet", "abc-defg-hij");
+    const result = await loadMeetingRecording(126);
 
-    expect(calls[0].url).toBe("/api/vexa/audio/google_meet/abc-defg-hij");
-    expect((calls[0].init?.headers as Record<string, string>).Range).toBe("bytes=0-0");
-    expect(probe.availability).toEqual({ state: "available" });
-    expect(probe.sizeBytes).toBe(5242880);
-    expect(probe.contentType).toBe("audio/webm");
+    expect(calls[0]).toBe("/api/recordings/126");
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.recording.objectUrl).toMatch(/^blob:mock\//);
+      expect(result.recording.sizeBytes).toBe(2048);
+      expect(result.recording.contentType).toBe("audio/webm");
+    }
   });
 
-  it("classifies the 404 body", async () => {
+  it("classifies the failure body instead of throwing", async () => {
     stubFetch(
-      new Response(JSON.stringify({ detail: "Audio deleted per retention policy" }), {
+      new Response(JSON.stringify({ detail: "No recorded audio found for this meeting" }), {
         status: 404,
         headers: { "content-type": "application/json" },
       })
     );
 
-    const probe = await probeMeetingAudio("google_meet", "abc-defg-hij");
+    const result = await loadMeetingRecording(126);
 
-    expect(probe.availability).toEqual({
-      state: "unavailable",
-      reason: "deleted",
-      message: "Audio deleted per retention policy",
+    expect(result).toEqual({
+      ok: false,
+      failure: {
+        state: "unavailable",
+        reason: "never_recorded",
+        message: "No recorded audio found for this meeting",
+      },
     });
-    expect(probe.sizeBytes).toBeNull();
   });
 
-  it("reports a network failure as an error rather than throwing", async () => {
+  it("reports a network failure as an error", async () => {
     stubFetch(new Error("connection refused"));
 
-    const probe = await probeMeetingAudio("google_meet", "abc-defg-hij");
+    const result = await loadMeetingRecording(126);
 
-    expect(probe.availability).toEqual({ state: "error", message: "connection refused" });
+    expect(result).toEqual({ ok: false, failure: { state: "error", message: "connection refused" } });
   });
 });

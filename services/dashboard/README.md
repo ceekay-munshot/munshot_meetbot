@@ -62,17 +62,25 @@ Local dev server runs on `http://localhost:3001`.
 
 ## Recording Playback (Post-Meeting)
 
-The meeting detail page shows a Recording card above the transcript: an inline player plus a Download button, and a `Download recording` entry in the Export menu. Availability is resolved once per meeting by `useMeetingRecording` (`src/hooks/use-meeting-recording.ts`), which range-requests a single byte so an absent recording costs nothing to detect.
+The meeting detail page shows a Recording card above the transcript: **Load recording** fetches the audio and plays it inline, **Download** saves it, and the Export menu carries a `Download recording` entry. State lives in `useMeetingRecording` (`src/hooks/use-meeting-recording.ts`), so one fetch serves both the player and Save.
 
-Backend requirement:
-- `GET /audio/{platform}/{native_meeting_id}` streams the recorded audio (webm by default) with `Range` support (`206`) so browser seeking works.
-- A `404` means one of two things, and the wording tells them apart: audio deleted per retention policy, versus nothing was ever recorded. The UI shows the API's message either way.
+Backend: `GET /public/audio/{meeting_id}` on the gateway.
+- Keyed by our **database meeting id**, not `(platform, native_meeting_id)` — recurring meetings reuse the same Meet code across occurrences.
+- Audio is assembled from raw chunks per request and returned in one shot (no `Range`/`206`), so there is no cheap way to ask "does a recording exist?" — asking costs the same as downloading. The UI therefore loads on an explicit click, never on page load.
+- A `404` means one of two things, and the wording tells them apart: audio deleted per retention policy (`AUDIO_RETENTION_DAYS`), versus nothing was ever recorded. The UI shows the API's message either way.
+
+Auth is a two-hop trust model, mirroring `/public/join`: the gateway authorizes on the shared system key (`PUBLIC_BOT_API_KEY`) and does **no** per-user ownership check, expecting the calling BFF to know which of its users owns which meeting. The dashboard's route (`src/app/api/recordings/[meetingId]/route.ts`) is that BFF:
+
+1. resolves the meeting with the **caller's own token** (`GET /bots/id/{id}`, which 404s for meetings that token doesn't own — the same visibility the transcript view enforces);
+2. only then fetches the audio with the system key.
+
+Skipping step 1 would hand every logged-in user the system key's reach, letting them walk meeting ids for other tenants' recordings.
+
+Config: `VEXA_SYSTEM_API_KEY` must equal the gateway's `PUBLIC_BOT_API_KEY`. It falls back to `VEXA_API_KEY`, which is already the same value in Compose (`PUBLIC_BOT_API_KEY=${VEXA_API_KEY}`), so Compose needs no extra setting; split deployments set it explicitly.
 
 Notes:
-- The dashboard fetches audio through its own `/api/vexa/...` proxy to avoid MinIO/S3 CORS issues, and so the browser authenticates with its session cookie instead of an API key.
 - Playback is not synced to transcript segments: recording is presence-gated, so audio `t=0` does not necessarily line up with the first transcript segment.
-
-Older recording endpoints (`/recordings/{recording_id}/media/{media_file_id}/raw`) are still proxied by the gateway but are not used by the dashboard.
+- Older recording endpoints (`/recordings/{recording_id}/media/{media_file_id}/raw`) are still proxied by the gateway but are not used by the dashboard.
 
 ## URL Proxy Pattern
 
@@ -81,6 +89,7 @@ All gateway requests from the browser go through Next.js server-side proxies —
 | Browser path | Proxied to | Configured in |
 |---|---|---|
 | `/api/vexa/*` | `${VEXA_API_URL}/*` | `src/app/api/vexa/[...path]/route.ts` |
+| `/api/recordings/{meeting_id}` | `${VEXA_API_URL}/public/audio/{meeting_id}` | `src/app/api/recordings/[meetingId]/route.ts` |
 | `/b/*` | `${VEXA_API_URL}/b/*` | `next.config.ts` rewrites |
 
 **Rule:** Components must use relative paths (`/b/{token}/save`, `/api/vexa/meetings`) for fetch calls. The public gateway URL (`publicApiUrl` from `/api/config`) is only for display purposes (e.g., CDP connection strings for external tools).

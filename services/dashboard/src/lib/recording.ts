@@ -1,35 +1,30 @@
 // Meeting recording (audio) helpers.
 //
-// The API exposes the recorded meeting audio at
-//   GET /audio/{platform}/{native_meeting_id}   (X-API-Key auth)
-// which streams the raw media bytes (webm by default). The dashboard reaches it
-// through the same-origin proxy at /api/vexa/* so the browser sends the session
-// cookie instead of an API key, and so <audio> can range-request it directly.
+// The gateway serves recorded audio at GET /public/audio/{meeting_id} — keyed by
+// our own database id, not (platform, native_meeting_id), because recurring
+// meetings reuse the same native id across occurrences. It is a system-key
+// endpoint, so the browser goes through the dashboard's own route at
+// /api/recordings/{meeting_id}, which checks ownership before attaching that key.
 //
-// A 404 carries meaning: the recording was either dropped by the retention
-// policy or never captured. Those read very differently to a user, so we keep
-// the distinction instead of collapsing both into "not found".
+// Two things shape the UI here:
+//   * The audio is assembled from raw chunks per request and served in one shot
+//     (no Range support), so there is no cheap "does it exist" probe — asking is
+//     as expensive as downloading. Loading is therefore an explicit user action.
+//   * A 404 carries meaning: audio dropped by the retention policy reads very
+//     differently from a meeting that never recorded anything.
 
 import { format } from "date-fns";
 import { withBasePath } from "@/lib/base-path";
 import { parseUTCTimestamp } from "@/lib/utils";
-import type { Meeting, Platform } from "@/types/vexa";
+import type { Meeting } from "@/types/vexa";
 
-export type RecordingAvailability =
-  | { state: "available" }
+export type RecordingFailure =
   | { state: "unavailable"; reason: "deleted" | "never_recorded"; message: string }
   | { state: "error"; message: string };
 
-export interface RecordingProbe {
-  availability: RecordingAvailability;
-  /** Total size of the recording in bytes, when the server reported it. */
-  sizeBytes: number | null;
-  contentType: string | null;
-}
-
-/** Same-origin URL for the meeting audio, proxied through /api/vexa. */
-export function audioEndpointPath(platform: Platform | string, nativeMeetingId: string): string {
-  return withBasePath(`/api/vexa/audio/${platform}/${encodeURIComponent(nativeMeetingId)}`);
+/** Same-origin URL for the meeting audio. */
+export function recordingEndpointPath(meetingId: string | number): string {
+  return withBasePath(`/api/recordings/${encodeURIComponent(String(meetingId))}`);
 }
 
 /** Pull the error message out of a FastAPI/JSON error body, falling back to raw text. */
@@ -49,23 +44,25 @@ function errorDetail(body: string): string {
 }
 
 /**
- * Turn an audio-endpoint response into something the UI can render.
+ * Turn a failed audio response into something the UI can render.
  * Pure so the 404 wording rules stay testable.
  */
-export function classifyAudioResponse(status: number, body: string): RecordingAvailability {
-  if (status >= 200 && status < 300) {
-    return { state: "available" };
-  }
-
+export function classifyRecordingFailure(status: number, body: string): RecordingFailure {
   const detail = errorDetail(body);
 
   if (status === 404) {
-    // "deleted per retention policy" vs "no recorded audio found"
+    // meeting-api answers 404 three ways: "Audio ... deleted per retention
+    // policy at <ts>", "No recorded audio found for this meeting", and
+    // "Meeting not found: <id>". Only the first is a recording that once existed.
     const deleted = /retention|deleted|expired/i.test(detail);
     return {
       state: "unavailable",
       reason: deleted ? "deleted" : "never_recorded",
-      message: detail || (deleted ? "Recording deleted per retention policy." : "No recording available for this meeting."),
+      message:
+        detail ||
+        (deleted
+          ? "Audio for this meeting was deleted per retention policy."
+          : "No recorded audio found for this meeting."),
     };
   }
 
@@ -73,68 +70,54 @@ export function classifyAudioResponse(status: number, body: string): RecordingAv
     return { state: "error", message: detail || "Not authorized to access this recording." };
   }
 
-  return { state: "error", message: detail || `Could not load the recording (HTTP ${status}).` };
-}
-
-/**
- * Total byte size of the media, preferring the `Content-Range` total (set when
- * the server honoured our 1-byte range probe) over `Content-Length`.
- */
-export function parseTotalBytes(contentRange: string | null, contentLength: string | null): number | null {
-  if (contentRange) {
-    const match = /\/\s*(\d+)\s*$/.exec(contentRange);
-    if (match) {
-      const total = Number(match[1]);
-      if (Number.isFinite(total)) return total;
-    }
-  }
-  if (contentLength) {
-    const total = Number(contentLength);
-    // A ranged response reports the length of the slice, not the whole file, so
-    // only trust Content-Length when there is no Content-Range alongside it.
-    if (Number.isFinite(total) && !contentRange) return total;
-  }
-  return null;
-}
-
-/**
- * Ask for a single byte to learn whether a recording exists without pulling the
- * whole file down. Servers that ignore `Range` answer 200 with the full body,
- * so the body is always cancelled once the headers have been read.
- */
-export async function probeMeetingAudio(
-  platform: Platform | string,
-  nativeMeetingId: string,
-  signal?: AbortSignal
-): Promise<RecordingProbe> {
-  let response: Response;
-  try {
-    response = await fetch(audioEndpointPath(platform, nativeMeetingId), {
-      headers: { Range: "bytes=0-0" },
-      signal,
-    });
-  } catch (error) {
+  if (status === 504) {
     return {
-      availability: { state: "error", message: (error as Error).message || "Network error" },
-      sizeBytes: null,
-      contentType: null,
+      state: "error",
+      message: detail || "Timed out assembling the recording. Try again in a moment.",
     };
   }
 
-  const contentType = response.headers.get("content-type");
-  const sizeBytes = parseTotalBytes(
-    response.headers.get("content-range"),
-    response.headers.get("content-length")
-  );
+  return { state: "error", message: detail || `Could not load the recording (HTTP ${status}).` };
+}
 
-  if (response.ok) {
-    // Headers are all we need — drop the bytes on the floor.
-    await response.body?.cancel().catch(() => {});
-    return { availability: { state: "available" }, sizeBytes, contentType };
+export interface LoadedRecording {
+  /** Object URL for the downloaded blob — playable and saveable without refetching. */
+  objectUrl: string;
+  sizeBytes: number;
+  contentType: string;
+}
+
+export type RecordingLoad = { ok: true; recording: LoadedRecording } | { ok: false; failure: RecordingFailure };
+
+/**
+ * Download the recording in full. There is no partial/HEAD mode upstream, and
+ * the same bytes back both playback and Save, so one fetch does both jobs.
+ */
+export async function loadMeetingRecording(
+  meetingId: string | number,
+  signal?: AbortSignal
+): Promise<RecordingLoad> {
+  let response: Response;
+  try {
+    response = await fetch(recordingEndpointPath(meetingId), { signal });
+  } catch (error) {
+    return { ok: false, failure: { state: "error", message: (error as Error).message || "Network error" } };
   }
 
-  const body = await response.text().catch(() => "");
-  return { availability: classifyAudioResponse(response.status, body), sizeBytes: null, contentType };
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    return { ok: false, failure: classifyRecordingFailure(response.status, body) };
+  }
+
+  const blob = await response.blob();
+  return {
+    ok: true,
+    recording: {
+      objectUrl: URL.createObjectURL(blob),
+      sizeBytes: blob.size,
+      contentType: blob.type || response.headers.get("content-type") || "",
+    },
+  };
 }
 
 const CONTENT_TYPE_EXTENSIONS: Array<[RegExp, string]> = [
@@ -176,8 +159,37 @@ export function formatBytes(bytes: number | null): string {
 }
 
 /**
+ * What we can say about a recording without spending a request.
+ *
+ * The retention sweep stamps `data.recording.audio_deleted_at` when it purges
+ * the chunks, so an expired recording is knowable for free. Absence of
+ * `data.recording` is NOT proof there is no audio — that key is only written
+ * when a chunk arrives flagged final — so it stays "unknown" and the user
+ * decides whether to ask.
+ */
+export function knownRecordingState(meeting: Meeting | null): RecordingFailure | null {
+  const deletedAt = meeting?.data?.recording?.audio_deleted_at;
+  if (typeof deletedAt === "string" && deletedAt) {
+    return {
+      state: "unavailable",
+      reason: "deleted",
+      message: `Audio was deleted per retention policy on ${formatDeletedAt(deletedAt)}.`,
+    };
+  }
+  return null;
+}
+
+function formatDeletedAt(timestamp: string): string {
+  try {
+    return format(parseUTCTimestamp(timestamp), "d MMM yyyy");
+  } catch {
+    return timestamp;
+  }
+}
+
+/**
  * Recordings only exist once the bot has actually captured something, so there
- * is nothing to look for while the meeting is still being set up.
+ * is nothing to offer while the meeting is still being set up.
  */
 export function canHaveRecording(status: Meeting["status"]): boolean {
   return status === "active" || status === "stopping" || status === "completed" || status === "failed";

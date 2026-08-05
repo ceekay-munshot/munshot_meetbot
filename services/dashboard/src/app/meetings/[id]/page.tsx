@@ -616,9 +616,17 @@ export default function MeetingDetailPage() {
     }
   }, [editedNotes]);
 
-  // Recorded meeting audio (GET /audio/{platform}/{native_meeting_id}). Probed
-  // once here so the player card and both export menus agree on availability.
+  // Recorded meeting audio (GET /public/audio/{meeting_id}, via /api/recordings).
+  // Fetched on demand — the API assembles it per request — and shared with the
+  // export menus so one fetch serves both the player and Save.
   const recording = useMeetingRecording(currentMeeting);
+
+  const handleDownloadRecording = useCallback(async () => {
+    const result = await recording.download();
+    if (!result.ok) {
+      toast.error("Recording unavailable", { description: result.failure.message });
+    }
+  }, [recording]);
 
   // Browser session check runs first — transcript errors must not block the VNC view.
   // The transcript fetch is skipped for active browser sessions, but if a stale error
@@ -950,12 +958,10 @@ export default function MeetingDetailPage() {
                     <Code className="h-4 w-4 mr-2" />
                     Download metadata
                   </DropdownMenuItem>
-                  {recording.isAvailable && (
-                    <DropdownMenuItem asChild>
-                      <a href={recording.url} download={recording.filename} className="flex items-center">
-                        <FileVideo className="h-4 w-4 mr-2" />
-                        Download recording
-                      </a>
+                  {recording.isSupported && (
+                    <DropdownMenuItem onClick={handleDownloadRecording} disabled={recording.isLoading}>
+                      <FileVideo className="h-4 w-4 mr-2" />
+                      {recording.isLoading ? "Preparing recording…" : "Download recording"}
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuSeparator />
@@ -1280,12 +1286,10 @@ export default function MeetingDetailPage() {
                       <Code className="h-4 w-4 mr-2" />
                       Download metadata
                     </DropdownMenuItem>
-                    {recording.isAvailable && (
-                      <DropdownMenuItem asChild>
-                        <a href={recording.url} download={recording.filename} className="flex items-center">
-                          <FileVideo className="h-4 w-4 mr-2" />
-                          Download recording
-                        </a>
+                    {recording.isSupported && (
+                      <DropdownMenuItem onClick={handleDownloadRecording} disabled={recording.isLoading}>
+                        <FileVideo className="h-4 w-4 mr-2" />
+                        {recording.isLoading ? "Preparing recording…" : "Download recording"}
                       </DropdownMenuItem>
                     )}
                     <DropdownMenuSeparator />
