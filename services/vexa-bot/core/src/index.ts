@@ -26,7 +26,7 @@ import { createClient, RedisClientType } from 'redis';
 import { Page, Browser, BrowserContext } from 'playwright-core';
 import { execSync } from 'child_process';
 import * as net from 'net';
-import { ensureBrowserDataDir, syncBrowserDataFromS3, syncBrowserDataToS3, cleanStaleLocks, BROWSER_DATA_DIR } from './s3-sync';
+import { ensureBrowserDataDir, syncBrowserDataFromS3, syncBrowserDataToS3, cleanStaleLocks, uploadFailureScreenshots, BROWSER_DATA_DIR } from './s3-sync';
 // HTTP imports removed - using unified callback service instead
 
 // Per-speaker transcription pipeline
@@ -892,6 +892,18 @@ async function performGracefulLeave(
   if (meetingApiCallbackUrl && currentConnectionId) {
     // Use unified callback for exit status
     const statusMapping = mapExitReasonToStatus(finalCallbackReason, finalCallbackExitCode);
+
+    // Upload the join/admission diagnostic screenshots (join.ts, admission.ts)
+    // for failed meetings only, before this ephemeral container is torn down —
+    // otherwise there's no way to see what the bot actually saw on screen.
+    if (statusMapping.status === 'failed' && currentBotConfig) {
+      try {
+        uploadFailureScreenshots(currentBotConfig, currentBotConfig.meeting_id);
+        log(`[Graceful Leave] Uploaded failure screenshots for meeting ${currentBotConfig.meeting_id}.`);
+      } catch (shotErr: any) {
+        log(`[Graceful Leave] Failure screenshot upload failed: ${shotErr.message}`);
+      }
+    }
 
     const botConfig = {
       meetingApiCallbackUrl,

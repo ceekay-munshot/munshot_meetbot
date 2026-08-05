@@ -261,6 +261,7 @@ services:
       - NOTETAKER_S3_PATH=${NOTETAKER_S3_PATH:-}
       - RECORDING_ENABLED=${RECORDING_ENABLED:-true}
       - CAPTURE_MODES=${CAPTURE_MODES:-audio}
+      - AUDIO_RETENTION_DAYS=${AUDIO_RETENTION_DAYS:-7}
       - TRANSCRIPTION_SERVICE_URL=${TRANSCRIPTION_SERVICE_URL:-}
       - TRANSCRIPTION_SERVICE_TOKEN=${TRANSCRIPTION_SERVICE_TOKEN:-}
       - TRANSCRIPTION_GATEWAY_URL=${TRANSCRIPTION_GATEWAY_URL:-}
@@ -274,6 +275,15 @@ services:
       - CF_D1_DATABASE_ID=${CF_D1_DATABASE_ID:-}
       - CF_API_TOKEN=${CF_API_TOKEN:-}
       - CF_D1_TABLE=${CF_D1_TABLE:-transcriptions}
+      # YouTube transcripts (POST /youtube/transcripts, /public/youtube). Captions
+      # first, Deepgram ASR fallback. Concurrency is capped low on purpose: yt-dlp
+      # + ffmpeg compete with meeting bots for a 4-core host, where each bot needs
+      # ~0.6 core sustained.
+      - YOUTUBE_MAX_CONCURRENT_JOBS=${YOUTUBE_MAX_CONCURRENT_JOBS:-1}
+      - YOUTUBE_MAX_DURATION_SECONDS=${YOUTUBE_MAX_DURATION_SECONDS:-14400}
+      - YOUTUBE_CAPTION_LANGS=${YOUTUBE_CAPTION_LANGS:-en,en-US,en-GB}
+      - CF_D1_YOUTUBE_TABLE=${CF_D1_YOUTUBE_TABLE:-youtube_transcripts}
+      - CF_D1_YOUTUBE_SEGMENTS_TABLE=${CF_D1_YOUTUBE_SEGMENTS_TABLE:-youtube_transcript_segments}
     volumes:
       - ${LOCAL_STORAGE_VOLUME_SOURCE:-recordings-data}:/data/recordings
     init: true

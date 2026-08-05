@@ -161,3 +161,86 @@ class MeetingOwner(Base):
     __table_args__ = (
         Index('uq_meeting_owner_meeting_user', 'meeting_id', 'user_id', unique=True),
     )
+
+
+class YouTubeTranscript(Base):
+    """A transcript job for one public YouTube video, owned by a Vexa user.
+
+    Deliberately NOT modelled as a synthetic `meetings` row: a video has no bot,
+    no session, no participants and no lifecycle, so reusing that table would mean
+    a permanently-'completed' meeting with half its columns meaningless — and it
+    would surface in the meetings list the Cloudflare frontend renders.
+
+    Full transcript text is NOT stored here; it is derived from the segments below
+    (the D1 mirror computes it once for cheap frontend reads). Keeping one copy in
+    Postgres avoids the text living twice in the source of truth.
+    """
+    __tablename__ = "youtube_transcripts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Owner = the user resolved from the caller's email, same trust model as
+    # /public/join. Drives the owner_email on the D1 mirror.
+    user_id = Column(Integer, nullable=False, index=True)
+    video_id = Column(String(32), nullable=False, index=True)
+    url = Column(Text, nullable=False)
+    title = Column(Text, nullable=True)
+    channel = Column(Text, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+    # queued | processing | completed | failed
+    status = Column(String(20), nullable=False, server_default='queued', default='queued', index=True)
+    # Which path produced the transcript: 'captions' (YouTube's own subtitles, free)
+    # or 'deepgram' (audio downloaded and sent through the batch ASR path).
+    source = Column(String(20), nullable=True)
+    language = Column(String(16), nullable=True)
+    segment_count = Column(Integer, nullable=False, server_default='0', default=0)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    completed_at = Column(DateTime, nullable=True)
+
+    segments = relationship(
+        "YouTubeTranscriptSegment",
+        back_populates="transcript",
+        cascade="all, delete-orphan",
+        order_by="YouTubeTranscriptSegment.segment_index",
+    )
+
+    # Unique INDEX rather than UniqueConstraint, for the same reason as
+    # meeting_owners above: schema-sync reconciles missing indexes on an
+    # already-existing table, but not constraints. One transcript per
+    # (owner, video) makes re-POSTing the same link idempotent.
+    __table_args__ = (
+        Index('uq_youtube_transcript_user_video', 'user_id', 'video_id', unique=True),
+        Index('ix_youtube_transcript_user_created', 'user_id', 'created_at'),
+    )
+
+
+class YouTubeTranscriptSegment(Base):
+    """One timed line of a YouTube transcript.
+
+    Mirrors the shape of `transcriptions` (start/end/text/speaker/language) so the
+    frontend can render a video transcript with the same component it uses for a
+    meeting. `speaker` is NULL on the captions path (YouTube gives no diarization)
+    and carries a Deepgram speaker label on the ASR path.
+    """
+    __tablename__ = "youtube_transcript_segments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transcript_id = Column(
+        Integer, ForeignKey("youtube_transcripts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    segment_index = Column(Integer, nullable=False)
+    start_time = Column(Float, nullable=False)
+    end_time = Column(Float, nullable=False)
+    text = Column(Text, nullable=False)
+    speaker = Column(String(255), nullable=True)
+    language = Column(String(16), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    transcript = relationship("YouTubeTranscript", back_populates="segments")
+
+    __table_args__ = (
+        Index('uq_youtube_segment_transcript_index', 'transcript_id', 'segment_index', unique=True),
+        Index('ix_youtube_segment_transcript_start', 'transcript_id', 'start_time'),
+    )

@@ -56,6 +56,25 @@ def _prefix(meeting_id: int, session_uid: Optional[str] = None) -> str:
     return f"recordings/{meeting_id}/"
 
 
+def screenshots_prefix(meeting_id: int) -> str:
+    """Where the bot uploads its join/admission diagnostic screenshots on failure
+    (see vexa-bot core/src/s3-sync.ts uploadFailureScreenshots)."""
+    return f"meeting-screenshots/{meeting_id}/"
+
+
+def _is_chunk_key(key: str, meeting_id: int) -> bool:
+    """True only for keys in the CURRENT layout: recordings/{meeting_id}/{session}/{seq}.{fmt}.
+
+    A pre-0.10.5 layout wrote recordings/{user_id}/{recording_id}/{session}/audio/{seq}.{fmt},
+    which shares the `recordings/<int>/` prefix with this meeting's namespace. Without
+    this shape check, listing or deleting meeting N would also reach user N's legacy
+    tree — assembling foreign audio into a transcript, or deleting it. Nothing in the
+    live bucket uses the legacy layout any more; this keeps it that way by construction.
+    """
+    parts = key.split("/")
+    return len(parts) == 4 and parts[0] == "recordings" and parts[1] == str(meeting_id)
+
+
 def _ensure_bucket(s3, bucket: str) -> None:
     try:
         s3.head_bucket(Bucket=bucket)
@@ -78,37 +97,83 @@ def _put_chunk_sync(meeting_id: int, session_uid: str, chunk_seq: int, fmt: str,
     return key
 
 
-def _list_keys_sync(meeting_id: int, session_uid: Optional[str]) -> List[str]:
+def _list_objects_sync(meeting_id: int, session_uid: Optional[str]) -> List[Tuple[str, int]]:
+    """(key, size) for every chunk of this meeting, sorted by key.
+
+    Lexical sort == numeric because seq is zero-padded; if multiple sessions are
+    present (session_uid=None), they group by session then by seq.
+    """
     s3 = _client()
     bucket = _bucket()
-    keys: List[str] = []
+    objects: List[Tuple[str, int]] = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=_prefix(meeting_id, session_uid)):
         for obj in page.get("Contents", []) or []:
-            keys.append(obj["Key"])
-    # Lexical sort == numeric because seq is zero-padded; if multiple sessions
-    # are present (session_uid=None), they group by session then by seq.
-    keys.sort()
-    return keys
+            key = obj["Key"]
+            if _is_chunk_key(key, meeting_id):
+                objects.append((key, int(obj.get("Size") or 0)))
+    objects.sort()
+    return objects
+
+
+def _list_keys_sync(meeting_id: int, session_uid: Optional[str]) -> List[str]:
+    return [k for k, _ in _list_objects_sync(meeting_id, session_uid)]
+
+
+def _dominant_session(objects: List[Tuple[str, int]]) -> Optional[str]:
+    """The session_uid holding the most audio bytes.
+
+    Session uids are random UUIDs, so "lexically first" (the previous rule) picked
+    an arbitrary session whenever a bot reconnected mid-meeting — sometimes the
+    3-second stub instead of the real 90-minute recording. Byte count is the only
+    ordering signal available from the key layout, and the real session is the one
+    with the audio in it.
+    """
+    by_session: dict[str, int] = {}
+    for key, size in objects:
+        by_session[key.split("/")[2]] = by_session.get(key.split("/")[2], 0) + size
+    if not by_session:
+        return None
+    return max(by_session, key=by_session.get)
 
 
 def _assemble_sync(meeting_id: int, session_uid: Optional[str]) -> Tuple[bytes, str, int]:
     s3 = _client()
     bucket = _bucket()
-    keys = _list_keys_sync(meeting_id, session_uid)
-    if not keys:
+    objects = _list_objects_sync(meeting_id, session_uid)
+    if not objects:
         return b"", "", 0
-    # If no session pinned, use the session of the FIRST (lexically) chunk so we
-    # never splice two different sessions' audio together.
+    # Never splice two sessions' audio together: each MediaRecorder session has
+    # its own container header, so a byte-wise concat across sessions is not
+    # decodable. Pin to the session that actually holds the recording.
     if session_uid is None:
-        first_session = keys[0].split("/")[2]
-        keys = [k for k in keys if k.split("/")[2] == first_session]
-    fmt = keys[-1].rsplit(".", 1)[-1] or "webm"
-    parts: List[bytes] = []
-    for k in keys:
+        chosen = _dominant_session(objects)
+        dropped = sum(1 for k, _ in objects if k.split("/")[2] != chosen)
+        objects = [(k, s) for k, s in objects if k.split("/")[2] == chosen]
+        if dropped:
+            logger.warning(
+                f"recording_store: meeting {meeting_id} has multiple sessions; assembling "
+                f"session {chosen} ({len(objects)} chunks) and skipping {dropped} chunk(s) "
+                f"from other session(s)"
+            )
+    fmt = objects[-1][0].rsplit(".", 1)[-1] or "webm"
+    # Accumulate into one pre-sized buffer instead of a list of per-chunk bytes:
+    # drops the intermediate list (hundreds of objects, each its own allocation)
+    # and avoids realloc-on-grow. The final bytes() copy still transiently doubles
+    # the blob, so a long meeting remains the memory-hungry case for meeting-api's
+    # 1 GiB cgroup — eliminating that needs the blob spilled to a temp file and
+    # streamed to the transcription service, which is a larger change than this.
+    buf = bytearray(sum(size for _, size in objects))
+    at = 0
+    for k, _ in objects:
         body = s3.get_object(Bucket=bucket, Key=k)["Body"].read()
-        parts.append(body)
-    return b"".join(parts), fmt, len(keys)
+        buf[at:at + len(body)] = body
+        at += len(body)
+    if at != len(buf):
+        # Listing size disagreed with what we actually read (chunk rewritten
+        # between list and get). Trust the bytes we have.
+        del buf[at:]
+    return bytes(buf), fmt, len(objects)
 
 
 # --- Async API ---------------------------------------------------------------
@@ -133,3 +198,47 @@ async def assemble_meeting_audio(
     empty bytes when nothing was recorded.
     """
     return await asyncio.to_thread(_assemble_sync, meeting_id, session_uid)
+
+
+def _delete_prefix_sync(prefix: str, key_filter=None) -> int:
+    s3 = _client()
+    bucket = _bucket()
+    deleted = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = page.get("Contents", []) or []
+        delete_keys = [
+            {"Key": obj["Key"]}
+            for obj in objects
+            if key_filter is None or key_filter(obj["Key"])
+        ]
+        if not delete_keys:
+            continue
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": delete_keys})
+        deleted += len(delete_keys)
+    return deleted
+
+
+def _delete_meeting_audio_sync(meeting_id: int) -> int:
+    return _delete_prefix_sync(
+        _prefix(meeting_id),
+        key_filter=lambda k: _is_chunk_key(k, meeting_id),
+    )
+
+
+def _delete_meeting_screenshots_sync(meeting_id: int) -> int:
+    return _delete_prefix_sync(screenshots_prefix(meeting_id))
+
+
+async def delete_meeting_audio(meeting_id: int) -> int:
+    """Delete every stored chunk for a meeting (all sessions). Returns count deleted."""
+    return await asyncio.to_thread(_delete_meeting_audio_sync, meeting_id)
+
+
+async def delete_meeting_screenshots(meeting_id: int) -> int:
+    """Delete the bot's failure-diagnostic screenshots for a meeting.
+
+    These are full-page PNGs uploaded once per failed join; nothing else ever
+    removed them, so the prefix grew without bound. Returns count deleted.
+    """
+    return await asyncio.to_thread(_delete_meeting_screenshots_sync, meeting_id)

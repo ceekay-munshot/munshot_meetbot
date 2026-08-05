@@ -17,6 +17,7 @@
   "dependencies": {
     "@ai-sdk/anthropic": "^2.0.54",
     "@ai-sdk/openai": "^2.0.80",
+    "@ai-sdk/provider": "^2.0.0",
     "@ai-sdk/react": "^2.0.112",
     "@auth/core": "^0.34.3",
     "@radix-ui/react-alert-dialog": "^1.1.15",

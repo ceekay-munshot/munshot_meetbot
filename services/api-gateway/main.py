@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, Request, Response, HTTPException, status, Depends, WebSocket, WebSocketDisconnect, Path
+from fastapi import FastAPI, Request, Response, HTTPException, status, Depends, WebSocket, WebSocketDisconnect, Path, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -1098,6 +1098,183 @@ async def get_transcript_proxy(platform: Platform, native_meeting_id: str, reque
     """Forward request to Transcription Collector to get a transcript."""
     url = f"{TRANSCRIPTION_COLLECTOR_URL}/transcripts/{platform.value}/{native_meeting_id}"
     return await forward_request(app.state.http_client, "GET", url, request)
+
+@app.get("/public/audio/{meeting_id}",
+        tags=["Public"],
+        summary="Get recorded audio for a specific meeting (server-to-server)",
+        description="Retrieves the assembled recording for a meeting specified by our own database ID — "
+                    "NOT (platform, native_meeting_id), since recurring meetings reuse the same native ID "
+                    "across every occurrence. Requires the system key in X-API-Key (this is a trusted "
+                    "server-to-server endpoint for a BFF like the Cloudflare Worker frontend, not for direct "
+                    "browser/client use — same trust model as /public/join). Audio is retained for a limited "
+                    "time (see AUDIO_RETENTION_DAYS) after which this 404s.")
+async def get_audio_proxy(meeting_id: int, x_api_key: Optional[str] = Depends(api_key_scheme)):
+    # Auth: trusted server-to-server only — caller must present the system key.
+    # No per-user API key exists for a BFF to present on a resolved user's
+    # behalf here (unlike a real end-user token flow); the Worker's own D1
+    # data is what scopes which meeting_id belongs to which of its users.
+    if not PUBLIC_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="Endpoint not configured (PUBLIC_BOT_API_KEY unset)")
+    if not x_api_key or not hmac.compare_digest(x_api_key, PUBLIC_BOT_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing system API key")
+
+    internal_secret = os.getenv("INTERNAL_API_SECRET", "")
+    headers = {"X-Internal-Secret": internal_secret} if internal_secret else {}
+    try:
+        resp = await app.state.http_client.get(
+            f"{TRANSCRIPTION_COLLECTOR_URL}/internal/audio/{meeting_id}", headers=headers,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
+
+# --- YouTube transcripts -----------------------------------------------------
+# Authenticated passthroughs for normal API-key callers and the dashboard.
+# forward_request handles key validation and strips spoofed identity headers.
+# NOTE the ".txt" route must be declared before the int-typed one, or FastAPI
+# tries int("5.txt") on /youtube/transcripts/5.txt and 422s before reaching it.
+
+@app.post("/youtube/transcripts", tags=["YouTube"],
+          summary="Queue a public YouTube video for transcription",
+          dependencies=[Depends(api_key_scheme)])
+async def create_youtube_transcript_proxy(request: Request):
+    return await forward_request(
+        app.state.http_client, "POST", f"{MEETING_API_URL}/youtube/transcripts", request,
+    )
+
+
+@app.get("/youtube/transcripts", tags=["YouTube"],
+         summary="List your YouTube transcripts",
+         dependencies=[Depends(api_key_scheme)])
+async def list_youtube_transcripts_proxy(request: Request):
+    return await forward_request(
+        app.state.http_client, "GET", f"{MEETING_API_URL}/youtube/transcripts", request,
+    )
+
+
+@app.get("/youtube/transcripts/{transcript_id}.txt", tags=["YouTube"],
+         summary="Get a YouTube transcript as plain text",
+         dependencies=[Depends(api_key_scheme)])
+async def get_youtube_transcript_text_proxy(transcript_id: int, request: Request):
+    return await forward_request(
+        app.state.http_client, "GET",
+        f"{MEETING_API_URL}/youtube/transcripts/{transcript_id}.txt", request,
+    )
+
+
+@app.get("/youtube/transcripts/{transcript_id}", tags=["YouTube"],
+         summary="Get a YouTube transcript with segments",
+         dependencies=[Depends(api_key_scheme)])
+async def get_youtube_transcript_proxy(transcript_id: int, request: Request):
+    return await forward_request(
+        app.state.http_client, "GET",
+        f"{MEETING_API_URL}/youtube/transcripts/{transcript_id}", request,
+    )
+
+
+class PublicYouTubeRequest(BaseModel):
+    email: str = Field(..., description="Client email — owns the resulting transcript (find-or-create).")
+    url: str = Field(..., description="Public YouTube URL, or a bare 11-char video id.")
+    force: bool = Field(False, description="Re-transcribe even if this video was already done for this user.")
+
+
+async def _youtube_owner_headers(email: str) -> dict:
+    """Resolve a client email to the injected per-user identity headers.
+
+    Same find-or-create trust model as /public/join: the system key authenticates
+    the BFF, and the email decides which user OWNS the transcript, so one client's
+    videos never appear under another's.
+    """
+    normalized = (email or "").strip().lower()
+    if not _EMAIL_RE.match(normalized):
+        raise HTTPException(status_code=422, detail="Invalid email")
+    user_data = await _find_or_create_user_by_email(app.state.http_client, normalized)
+    if not user_data or "id" not in user_data:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not resolve client user (admin-api unreachable or ADMIN_API_TOKEN unset)",
+        )
+    return {
+        "content-type": "application/json",
+        "x-api-key": PUBLIC_BOT_API_KEY,
+        "x-user-id": str(user_data["id"]),
+        "x-user-scopes": "bot",
+        "x-user-limits": str(user_data.get("max_concurrent_bots", 1)),
+    }
+
+
+def _require_system_key(x_api_key: Optional[str]) -> None:
+    if not PUBLIC_BOT_API_KEY:
+        raise HTTPException(status_code=503, detail="Endpoint not configured (PUBLIC_BOT_API_KEY unset)")
+    if not x_api_key or not hmac.compare_digest(x_api_key, PUBLIC_BOT_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing system API key")
+
+
+@app.post("/public/youtube", tags=["Public"], status_code=status.HTTP_202_ACCEPTED,
+          summary="Transcribe a public YouTube video, owned by a client email (server-to-server)",
+          description=(
+              "Single-call YouTube transcription for a BFF (e.g. a Cloudflare Worker). Takes a "
+              "client email plus a public YouTube link, find-or-creates the user for that email, "
+              "and queues a transcript OWNED by that user — so each client's data stays isolated. "
+              "Returns 202 with a transcript id immediately; the job tries the video's own captions "
+              "first and falls back to Deepgram ASR when there are none. Poll "
+              "GET /public/youtube/{transcript_id}?email=... until status is 'completed'. "
+              "Requires the system key in X-API-Key (trusted server-to-server, not for browsers)."
+          ))
+async def public_youtube_transcribe(
+    body: PublicYouTubeRequest, x_api_key: Optional[str] = Depends(api_key_scheme),
+):
+    _require_system_key(x_api_key)
+    headers = await _youtube_owner_headers(body.email)
+    try:
+        resp = await app.state.http_client.request(
+            "POST", f"{MEETING_API_URL}/youtube/transcripts", headers=headers,
+            content=json.dumps({"url": body.url, "force": body.force}),
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
+
+@app.get("/public/youtube/{transcript_id}.txt", tags=["Public"],
+         summary="Get a client's YouTube transcript as plain text (server-to-server)",
+         description="Plain-text form of GET /public/youtube/{transcript_id}. 409 while the job "
+                     "is still queued or processing.")
+async def public_youtube_transcript_text(
+    transcript_id: int,
+    email: str = Query(..., description="Client email that owns the transcript."),
+    x_api_key: Optional[str] = Depends(api_key_scheme),
+):
+    _require_system_key(x_api_key)
+    headers = await _youtube_owner_headers(email)
+    try:
+        resp = await app.state.http_client.get(
+            f"{MEETING_API_URL}/youtube/transcripts/{transcript_id}.txt", headers=headers,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+
+
+@app.get("/public/youtube/{transcript_id}", tags=["Public"],
+         summary="Get a client's YouTube transcript (server-to-server)",
+         description="Returns status plus, once completed, the full text and timed segments. "
+                     "Ownership is enforced against the email — another client's id 404s.")
+async def public_youtube_transcript(
+    transcript_id: int,
+    email: str = Query(..., description="Client email that owns the transcript."),
+    x_api_key: Optional[str] = Depends(api_key_scheme),
+):
+    _require_system_key(x_api_key)
+    headers = await _youtube_owner_headers(email)
+    try:
+        resp = await app.state.http_client.get(
+            f"{MEETING_API_URL}/youtube/transcripts/{transcript_id}", headers=headers,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
 
 
 # --- Public Transcript Share Links (no API integration needed by client) ---

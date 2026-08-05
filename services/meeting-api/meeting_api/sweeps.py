@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from .models import Meeting
 from .schemas import MeetingStatus, MeetingCompletionReason
@@ -286,6 +288,120 @@ async def _sweep_aggregation_retry(
     return swept
 
 
+# Audio-retention sweep config. Raw MinIO recording chunks are only needed
+# long enough for batch_transcribe.py to assemble + transcribe them once;
+# after that they just cost storage, so purge them AUDIO_RETENTION_DAYS after
+# the meeting was created. Checked on its own (slow) cadence — the query is
+# cheap when there's nothing to do, but there's no reason to hit MinIO's
+# list/delete API every 60s like the other sweeps.
+AUDIO_RETENTION_DAYS = float(os.getenv("AUDIO_RETENTION_DAYS", "7"))
+AUDIO_RETENTION_POLL_INTERVAL = 3600  # check hourly
+
+_last_audio_retention_sweep_at: float = 0.0
+
+
+async def _sweep_audio_retention(
+    db_session_factory: Callable[[], AsyncSession],
+) -> int:
+    """Purge stored media for finalized meetings older than AUDIO_RETENTION_DAYS.
+
+    Removes the meeting's MinIO audio chunks and its failure-diagnostic
+    screenshots, and drops the active-speaker timeline from `data` (it only
+    describes audio that no longer exists, and it is by far the largest JSONB
+    key — ~2 samples/second for the whole meeting).
+
+    Marks one of two keys so a later iteration doesn't re-scan the meeting:
+      - `data.recording.audio_deleted_at`         — media was actually deleted
+      - `data.recording.audio_retention_checked_at` — nothing was stored
+    They stay distinct because /audio reports "expired per retention policy" off
+    the former; marking it on a meeting that never recorded would lie.
+
+    The candidate query deliberately does NOT require `data->'recording'` to
+    exist. It used to, and that made this sweep dead code for its entire life:
+    `data.recording` is only written when a chunk arrives with is_final=true, and
+    the bot dropped that chunk whenever it was zero-length (fixed in
+    vexa-bot audio-pipeline `_handleChunk`), so the key was absent on 100% of
+    meetings and this WHERE clause matched 0 rows while audio accumulated
+    indefinitely. The retention guarantee must not depend on a bot-side success
+    signal — a meeting whose bot crashed is exactly the one whose audio needs
+    collecting. `->>` on a missing key yields NULL, so absent-key rows qualify.
+    """
+    from . import recording_store
+
+    threshold = datetime.utcnow() - timedelta(days=AUDIO_RETENTION_DAYS)
+    swept = 0      # meetings whose media we actually deleted
+    checked = 0    # meetings marked as having nothing stored
+
+    async with db_session_factory() as db:
+        stmt = text("""
+            SELECT id FROM meetings
+            WHERE status IN (:completed, :failed)
+              AND created_at < :threshold
+              AND data->'recording'->>'audio_deleted_at' IS NULL
+              AND data->'recording'->>'audio_retention_checked_at' IS NULL
+            ORDER BY created_at
+            LIMIT 200
+        """)
+        rows = (await db.execute(stmt, {
+            "completed": MeetingStatus.COMPLETED.value,
+            "failed": MeetingStatus.FAILED.value,
+            "threshold": threshold,
+        })).fetchall()
+
+        for row in rows:
+            meeting_id = row[0]
+            try:
+                deleted = await recording_store.delete_meeting_audio(meeting_id)
+                shots = await recording_store.delete_meeting_screenshots(meeting_id)
+            except Exception as e:
+                logger.error(
+                    f"[sweep] audio-retention: failed to delete stored media for meeting {meeting_id}: {e}",
+                    exc_info=True,
+                )
+                continue
+
+            meeting = await db.get(Meeting, meeting_id)
+            if not meeting:
+                continue
+            data_obj = dict(meeting.data or {})
+            rec = dict(data_obj.get("recording") or {})
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            if deleted:
+                rec["audio_deleted_at"] = now_iso
+                rec["audio_chunks_deleted"] = deleted
+                # The timeline maps diarized segments onto audio we just deleted;
+                # keep the count for forensics, drop the samples.
+                timeline = data_obj.get("speaker_timeline")
+                if isinstance(timeline, dict) and timeline.get("samples"):
+                    timeline = dict(timeline)
+                    timeline["samples_pruned"] = len(timeline["samples"])
+                    timeline["samples"] = []
+                    timeline["pruned_at"] = now_iso
+                    data_obj["speaker_timeline"] = timeline
+            else:
+                rec["audio_retention_checked_at"] = now_iso
+            if shots:
+                rec["screenshots_deleted"] = shots
+            data_obj["recording"] = rec
+            meeting.data = data_obj
+            flag_modified(meeting, "data")
+            await db.commit()
+            if deleted or shots:
+                swept += 1
+                logger.info(
+                    f"[sweep] audio-retention: purged {deleted} chunk(s) + {shots} screenshot(s) "
+                    f"for meeting {meeting_id} (older than {AUDIO_RETENTION_DAYS}d)"
+                )
+            else:
+                checked += 1
+
+    if checked:
+        logger.debug(
+            f"[sweep] audio-retention: {checked} meeting(s) past retention had no stored media"
+        )
+    return swept
+
+
 async def _sweep_container_stops() -> dict:
     """v0.10.5 Pack D.2 (#266) — durable container-stop outbox consumer.
 
@@ -328,10 +444,10 @@ async def start_sweeps(
     Pattern mirrors webhook_retry_worker.start_retry_worker — same
     shape, different responsibility.
     """
-    global _stop_event, sweep_iterations, sweep_last_iteration_at
+    global _stop_event, sweep_iterations, sweep_last_iteration_at, _last_audio_retention_sweep_at
     _stop_event = asyncio.Event()
 
-    logger.info("[sweeps] Starting meeting-api idle sweeps loop (Pack E.3.2 + H.4 + D.2)")
+    logger.info("[sweeps] Starting meeting-api idle sweeps loop (Pack E.3.2 + H.4 + D.2 + audio-retention)")
 
     while not _stop_event.is_set():
         sweep_iterations += 1
@@ -357,6 +473,18 @@ async def start_sweeps(
                 )
         except Exception as e:
             logger.error(f"[sweeps] iteration {sweep_iterations} aggregation-retry error: {e}", exc_info=True)
+
+        if time.time() - _last_audio_retention_sweep_at >= AUDIO_RETENTION_POLL_INTERVAL:
+            _last_audio_retention_sweep_at = time.time()
+            try:
+                purged = await _sweep_audio_retention(db_session_factory)
+                if purged > 0:
+                    logger.info(
+                        f"[sweeps] iteration {sweep_iterations}: "
+                        f"purged audio for {purged} meeting(s) past the {AUDIO_RETENTION_DAYS}d retention window"
+                    )
+            except Exception as e:
+                logger.error(f"[sweeps] iteration {sweep_iterations} audio-retention error: {e}", exc_info=True)
 
         try:
             stop_summary = await _sweep_container_stops()

@@ -281,9 +281,23 @@ export class UnifiedRecordingPipeline {
   }
 
   private async _handleChunk(chunk: AudioChunk): Promise<void> {
-    if (!chunk.data || chunk.data.length === 0) {
+    // An empty NON-final chunk carries nothing, so drop it. An empty FINAL
+    // chunk must still be uploaded: is_final=true is the ONLY signal meeting-api
+    // has that a recording is complete (see PulseAudioCapture.stop below —
+    // "server treats isFinal=true as the signal ... regardless of payload
+    // size"), and MediaRecorder routinely emits a zero-byte blob as its last
+    // ondataavailable on stop(). Dropping it here meant is_final never reached
+    // the server on the Google Meet / Teams path, so data.recording was never
+    // written — which silently disabled the audio-retention sweep (its WHERE
+    // requires data->'recording'), left session_uid unresolvable for batch
+    // transcription, and stopped /audio ever reporting "expired".
+    const data = chunk.data ?? Buffer.alloc(0);
+    if (data.length === 0 && !chunk.isFinal) {
       log(`[audio-pipeline] empty chunk dropped (${this.platform}, seq=${chunk.seq})`);
       return;
+    }
+    if (data.length === 0) {
+      log(`[audio-pipeline] empty FINAL chunk kept (${this.platform}, seq=${chunk.seq}) — is_final marker must reach the server`);
     }
 
     // Serialize uploads via the queue so chunks land in MinIO in seq order
@@ -295,7 +309,7 @@ export class UnifiedRecordingPipeline {
         await this.recordingService.uploadChunk(
           this.uploadUrl,
           this.token,
-          chunk.data,
+          data,
           chunk.seq,
           chunk.isFinal,
           chunk.format,

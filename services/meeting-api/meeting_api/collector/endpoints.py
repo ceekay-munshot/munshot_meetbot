@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import select, and_, func, distinct, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ import redis.asyncio as aioredis
 
 from ..database import get_db, async_session_local
 from ..models import Meeting, Transcription, MeetingSession
+from .. import recording_store
 from ..schemas import (
     MeetingResponse,
     MeetingListResponse,
@@ -253,6 +254,61 @@ async def get_transcript_by_native_id(
     response_data["speaker_events"] = (meeting.data or {}).get("speaker_events", []) if isinstance(meeting.data, dict) else []
     response_data["segments"] = sorted_segments
     return TranscriptionResponse(**response_data)
+
+
+@router.get("/internal/audio/{meeting_id}",
+            summary="[Internal] Get recorded audio for a specific meeting by its database ID",
+            include_in_schema=False,
+            dependencies=[Depends(require_internal_secret)])
+async def get_audio_by_meeting_id(
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Streams back the assembled recording for a meeting, looked up by our own
+    database id — NOT by (platform, native_meeting_id). Recurring meetings reuse
+    the same native_meeting_id across every occurrence, so that pair can't
+    identify a single meeting; the internal id is the only unambiguous key.
+
+    Internal-only (X-Internal-Secret), no per-user ownership check: the caller
+    is api-gateway's /public/audio/{meeting_id}, which is what actually gates
+    access — with a system key (PUBLIC_BOT_API_KEY), same trust model as
+    /public/join. There's no per-user API key a BFF like the Cloudflare Worker
+    frontend can present here, only the one shared system key, so ownership
+    enforcement has to happen at the caller (the Worker knows which of ITS
+    users owns which meeting_id via its own D1 data) rather than here.
+
+    Audio is only retained for AUDIO_RETENTION_DAYS (see sweeps.py); once purged
+    this 404s with a message distinguishing "never recorded" from "expired".
+    """
+    meeting = await db.get(Meeting, meeting_id)
+
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting not found: {meeting_id}"
+        )
+
+    rec = (meeting.data or {}).get("recording") or {}
+    if rec.get("audio_deleted_at"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Audio for this meeting was deleted per retention policy at {rec['audio_deleted_at']}"
+        )
+
+    session_uid = rec.get("session_uid")
+    audio_bytes, fmt, n_chunks = await recording_store.assemble_meeting_audio(meeting.id, session_uid)
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No recorded audio found for this meeting"
+        )
+
+    logger.info(f"[API Meet {meeting.id}] Serving assembled audio: {len(audio_bytes)} bytes from {n_chunks} chunk(s)")
+    return Response(
+        content=audio_bytes,
+        media_type=f"audio/{fmt or 'webm'}",
+        headers={"Content-Disposition": f'attachment; filename="meeting_{meeting.id}.{fmt or "webm"}"'},
+    )
 
 
 @router.post("/ws/authorize-subscribe",

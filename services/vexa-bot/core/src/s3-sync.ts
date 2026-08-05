@@ -29,7 +29,7 @@ function getS3Env(config: S3Config): Record<string, string> {
 }
 
 export function s3Sync(localDir: string, s3Path: string, config: S3Config, direction: 'up' | 'down', excludes: string[] = []): void {
-  if (!config.userdataS3Path || !config.s3Endpoint || !config.s3Bucket) return;
+  if (!config.s3Endpoint || !config.s3Bucket) return;
   const s3Uri = `s3://${config.s3Bucket}/${s3Path}`;
   const excludeArgs = excludes.map(e => `--exclude "${e}"`).join(' ');
   const deleteArg = '';
@@ -98,6 +98,21 @@ export function syncBrowserDataToS3(config: S3Config): void {
   }
 
   console.log(`[s3-sync] Uploaded ${uploaded} auth-essential items`);
+}
+
+export const SCREENSHOTS_DIR = '/app/storage/screenshots';
+
+// Upload the bot's diagnostic checkpoint screenshots (join.ts / admission.ts)
+// for failed meetings only — successful joins never call this, so this stays
+// cheap and doesn't fill the bucket with screenshots nobody needs.
+export function uploadFailureScreenshots(config: S3Config, meetingId: number | string): void {
+  if (!config.s3Endpoint || !config.s3Bucket) return;
+  if (!existsSync(SCREENSHOTS_DIR)) return;
+  try {
+    s3Sync(SCREENSHOTS_DIR, `meeting-screenshots/${meetingId}`, config, 'up');
+  } catch (err: any) {
+    console.log(`[s3-sync] Warning: failed to upload failure screenshots: ${err.message}`);
+  }
 }
 
 export function cleanStaleLocks(dir: string = BROWSER_DATA_DIR): void {

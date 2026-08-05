@@ -18,6 +18,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from sqlalchemy import text
 from sqlalchemy.orm.attributes import flag_modified
 
 from .models import Meeting
@@ -28,6 +29,23 @@ from .collector.processors import verify_meeting_token
 logger = logging.getLogger("meeting_api.recordings")
 
 router = APIRouter()
+
+# Merge the recording descriptor into meetings.data server-side rather than
+# read-modify-writing the whole JSONB column from this request's own session.
+# The bot's graceful leave uploads the final chunk and then exits, so the
+# container-exit callback rewrites the same `data` column moments later; a
+# read-modify-write here raced that write and could lose the `recording` key
+# entirely. `||` merges into whatever is committed at statement time.
+_MARK_RECORDING_COMPLETE_SQL = text("""
+    UPDATE meetings
+       SET data = jsonb_set(
+               COALESCE(data, '{}'::jsonb),
+               '{recording}',
+               COALESCE(data -> 'recording', '{}'::jsonb) || CAST(:rec AS jsonb),
+               true
+           )
+     WHERE id = :meeting_id
+""")
 
 
 def _auth_meeting_id(authorization: Optional[str]) -> int:
@@ -81,26 +99,24 @@ async def upload_recording_chunk(
         raise HTTPException(status_code=500, detail=f"chunk store failed: {e}")
 
     # On the final chunk, record where the audio lives so the post-meeting batch
-    # job knows a recording exists and which session/format to assemble.
+    # job knows a recording exists and which session/format to assemble, and so
+    # the audio-retention sweep can find (and later mark) this meeting.
     if final:
         try:
             async with async_session_local() as db:
-                meeting = await db.get(Meeting, meeting_id)
-                if meeting:
-                    data_obj = dict(meeting.data or {})
-                    rec = dict(data_obj.get("recording") or {})
-                    rec.update({
+                await db.execute(_MARK_RECORDING_COMPLETE_SQL, {
+                    "meeting_id": meeting_id,
+                    "rec": json.dumps({
                         "session_uid": session_uid,
                         "format": fmt,
                         "chunk_count": seq + 1,
                         "complete": True,
-                    })
-                    data_obj["recording"] = rec
-                    meeting.data = data_obj
-                    flag_modified(meeting, "data")
-                    await db.commit()
+                    }),
+                })
+                await db.commit()
         except Exception as e:
-            # Non-fatal: the batch job also self-discovers chunks via MinIO list.
+            # Non-fatal: the batch job also self-discovers chunks via MinIO list,
+            # and the retention sweep no longer depends on this key existing.
             logger.warning(f"recordings: could not mark recording complete for meeting {meeting_id}: {e}")
 
     return {"ok": True, "key": key, "seq": seq, "is_final": final}
