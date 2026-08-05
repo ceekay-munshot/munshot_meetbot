@@ -62,14 +62,17 @@ Local dev server runs on `http://localhost:3001`.
 
 ## Recording Playback (Post-Meeting)
 
-On completed meetings, the meeting detail page can show an audio playback strip (if a recording exists) and highlight transcript segments during playback. Clicking a segment seeks the audio.
+The meeting detail page shows a Recording card above the transcript: an inline player plus a Download button, and a `Download recording` entry in the Export menu. Availability is resolved once per meeting by `useMeetingRecording` (`src/hooks/use-meeting-recording.ts`), which range-requests a single byte so an absent recording costs nothing to detect.
 
-Backend requirements:
-- Vexa must expose recordings in the transcript response (so the dashboard can discover recordings without extra calls).
-- `GET /recordings/{recording_id}/media/{media_file_id}/raw` should stream audio with `Range` support (`206`) and `Content-Disposition: inline` so browser seeking works.
+Backend requirement:
+- `GET /audio/{platform}/{native_meeting_id}` streams the recorded audio (webm by default) with `Range` support (`206`) so browser seeking works.
+- A `404` means one of two things, and the wording tells them apart: audio deleted per retention policy, versus nothing was ever recorded. The UI shows the API's message either way.
 
 Notes:
-- The dashboard fetches audio through its own `/api/vexa/...` proxy to avoid MinIO/S3 CORS issues.
+- The dashboard fetches audio through its own `/api/vexa/...` proxy to avoid MinIO/S3 CORS issues, and so the browser authenticates with its session cookie instead of an API key.
+- Playback is not synced to transcript segments: recording is presence-gated, so audio `t=0` does not necessarily line up with the first transcript segment.
+
+Older recording endpoints (`/recordings/{recording_id}/media/{media_file_id}/raw`) are still proxied by the gateway but are not used by the dashboard.
 
 ## URL Proxy Pattern
 

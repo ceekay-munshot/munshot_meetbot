@@ -92,7 +92,9 @@ import { DocsLink } from "@/components/docs/docs-link";
 import { MeetingAgentPanel } from "@/components/agent/meeting-agent-panel";
 import { WebhookDeliverySection } from "@/components/webhooks/webhook-delivery-section";
 import { BrowserSessionView } from "@/components/meetings/browser-session-view";
+import { MeetingRecordingCard } from "@/components/meetings/meeting-recording-card";
 import { useRuntimeConfig } from "@/hooks/use-runtime-config";
+import { useMeetingRecording } from "@/hooks/use-meeting-recording";
 
 export default function MeetingDetailPage() {
   const params = useParams();
@@ -614,6 +616,10 @@ export default function MeetingDetailPage() {
     }
   }, [editedNotes]);
 
+  // Recorded meeting audio (GET /audio/{platform}/{native_meeting_id}). Probed
+  // once here so the player card and both export menus agree on availability.
+  const recording = useMeetingRecording(currentMeeting);
+
   // Browser session check runs first — transcript errors must not block the VNC view.
   // The transcript fetch is skipped for active browser sessions, but if a stale error
   // exists in the store (e.g. from a prior page visit), we still want to show the VNC.
@@ -944,6 +950,14 @@ export default function MeetingDetailPage() {
                     <Code className="h-4 w-4 mr-2" />
                     Download metadata
                   </DropdownMenuItem>
+                  {recording.isAvailable && (
+                    <DropdownMenuItem asChild>
+                      <a href={recording.url} download={recording.filename} className="flex items-center">
+                        <FileVideo className="h-4 w-4 mr-2" />
+                        Download recording
+                      </a>
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     onClick={() => {
@@ -1266,6 +1280,14 @@ export default function MeetingDetailPage() {
                       <Code className="h-4 w-4 mr-2" />
                       Download metadata
                     </DropdownMenuItem>
+                    {recording.isAvailable && (
+                      <DropdownMenuItem asChild>
+                        <a href={recording.url} download={recording.filename} className="flex items-center">
+                          <FileVideo className="h-4 w-4 mr-2" />
+                          Download recording
+                        </a>
+                      </DropdownMenuItem>
+                    )}
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       onClick={() => {
@@ -1556,6 +1578,12 @@ export default function MeetingDetailPage() {
             currentMeeting.status === "stopping" ||
             currentMeeting.status === "completed" ||
             (currentMeeting.status === "failed" && transcripts.length > 0)) && (
+            <>
+            <MeetingRecordingCard
+              recording={recording}
+              isLive={currentMeeting.status === "active"}
+              className="mb-2 lg:mb-6 flex-shrink-0"
+            />
             <TranscriptViewer
               meeting={currentMeeting}
               segments={transcripts}
@@ -1568,6 +1596,7 @@ export default function MeetingDetailPage() {
               wsReconnectAttempts={reconnectAttempts}
               headerActions={<DocsLink href="/docs/cookbook/get-transcripts" />}
             />
+            </>
           )}
           </>)}
 
