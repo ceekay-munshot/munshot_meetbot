@@ -43,6 +43,23 @@ logger = logging.getLogger("meeting_api.youtube_transcribe")
 
 # --- Config ------------------------------------------------------------------
 YT_DLP_BIN = os.getenv("YT_DLP_BIN", "yt-dlp")
+# YouTube blocks datacenter IPs. From AWS EC2 every request — including a plain
+# watch-page GET, not just the player API — comes back "Sign in to confirm you're
+# not a bot", with captionTracks stripped from the HTML. The identical video and
+# yt-dlp version work from a residential IP, so no player_client / extractor-arg
+# tuning fixes it (all of tv, ios, android, mweb, web_safari, web_embedded were
+# blocked identically). Only two things change the outcome:
+#
+#   YOUTUBE_COOKIES_FILE — Netscape cookies.txt from a signed-in session. Free
+#     and immediate. Use a THROWAWAY Google account: yt-dlp's own docs warn the
+#     account can be banned for automated use, and the notetaker account is
+#     load-bearing for no-knock meeting admission (NOTETAKER_S3_PATH).
+#   YOUTUBE_PROXY — a non-datacenter (residential/mobile) egress. Costs money but
+#     needs no account and does not expire.
+#
+# Both are plain yt-dlp flags, applied to every invocation below.
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip()
 # Cap concurrent jobs: each one is a yt-dlp download plus (on the ASR path) an
 # ffmpeg extract, on the same host as the meeting bots.
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("YOUTUBE_MAX_CONCURRENT_JOBS", "1")))
@@ -153,14 +170,90 @@ def _yt_dlp_available() -> bool:
     return shutil.which(YT_DLP_BIN) is not None
 
 
+def _check_cookies_file() -> None:
+    """Fail loudly and specifically on a misconfigured cookies file.
+
+    Without this the failure modes are all obscure: an unmounted path makes
+    yt-dlp report a generic error, and the compose mount's fallback source (see
+    docker-compose.yml) would hand yt-dlp a YAML file to parse as cookies. Both
+    look like "YouTube broke" unless you know to check.
+    """
+    if not YOUTUBE_COOKIES_FILE:
+        return
+    path = Path(YOUTUBE_COOKIES_FILE)
+    if not path.is_file():
+        raise YouTubeError(
+            f"YOUTUBE_COOKIES_FILE is set to {YOUTUBE_COOKIES_FILE!r} but no such file "
+            f"exists in the container — check the volume mount "
+            f"(YOUTUBE_COOKIES_HOST_FILE)."
+        )
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace")[:4096]
+    except OSError as e:
+        raise YouTubeError(f"YOUTUBE_COOKIES_FILE could not be read: {e}")
+    # Netscape cookies.txt is TSV; the header is conventional but optional, so
+    # accept either that or a plausible tab-separated youtube domain line.
+    if "# Netscape HTTP Cookie File" not in head and "\t" not in head:
+        raise YouTubeError(
+            f"YOUTUBE_COOKIES_FILE ({YOUTUBE_COOKIES_FILE}) is not a Netscape "
+            f"cookies.txt file — export with a cookies.txt browser extension, or "
+            f"check that YOUTUBE_COOKIES_HOST_FILE points at the right host path."
+        )
+
+
+def _yt_dlp(*args: str) -> List[str]:
+    """Build a yt-dlp argv with the auth/egress options applied.
+
+    Every invocation must go through here — a cookies file that covers metadata
+    but not the caption or audio fetch just moves the failure one step later.
+    """
+    _check_cookies_file()
+    argv = [YT_DLP_BIN, "--no-warnings", "--no-playlist"]
+    if YOUTUBE_COOKIES_FILE:
+        argv += ["--cookies", YOUTUBE_COOKIES_FILE]
+    if YOUTUBE_PROXY:
+        argv += ["--proxy", YOUTUBE_PROXY]
+    return argv + list(args)
+
+
+# YouTube's datacenter-IP challenge. Distinct from a per-video problem: it means
+# the server can't reach YouTube at all, so it must not read to the end user as
+# "this video is broken".
+#
+# Deliberately NOT matching a bare "sign in to confirm": the age gate says "Sign
+# in to confirm your age", which is a genuine per-video restriction and must keep
+# its own message. Match the bot-specific wording only. (YouTube renders the
+# apostrophe as U+2019, so avoid matching on "you're" at all.)
+_BOT_GATE_RE = re.compile(r"not a bot|too many requests|http error 429", re.I)
+
+BOT_GATE_MESSAGE = (
+    "YouTube is blocking transcript downloads from this server right now "
+    "(anti-bot check on the server's IP). This is an infrastructure issue, not a "
+    "problem with the video — the same link works elsewhere."
+)
+
+
 def _stderr_reason(stderr: bytes) -> str:
     """Surface yt-dlp's own ERROR line — it says 'Private video', 'Video
     unavailable', 'Sign in to confirm your age' etc., which is exactly what the
-    caller needs to hear."""
+    caller needs to hear.
+
+    The one case we rewrite is the bot gate: yt-dlp's text there is three lines of
+    --cookies-from-browser instructions and GitHub wiki links aimed at someone
+    running it on their laptop, which is meaningless (and alarming) rendered in a
+    customer-facing transcript page. Operators still get the raw text in the logs.
+    """
     for line in (stderr or b"").decode("utf-8", "replace").splitlines():
         line = line.strip()
         if line.startswith("ERROR:"):
-            return line[len("ERROR:"):].strip()
+            detail = line[len("ERROR:"):].strip()
+            if _BOT_GATE_RE.search(detail):
+                logger.error(
+                    "youtube: blocked by YouTube's anti-bot check — set "
+                    "YOUTUBE_COOKIES_FILE or YOUTUBE_PROXY. Raw: %s", detail
+                )
+                return BOT_GATE_MESSAGE
+            return detail
     return "yt-dlp failed (no ERROR line in output)"
 
 
@@ -171,8 +264,7 @@ async def fetch_metadata(video_id: str) -> Dict[str, Any]:
             f"{YT_DLP_BIN} is not installed in this image — cannot fetch YouTube videos"
         )
     code, stdout, stderr = await _run(
-        [YT_DLP_BIN, "--skip-download", "--dump-single-json", "--no-warnings",
-         "--no-playlist", canonical_url(video_id)],
+        _yt_dlp("--skip-download", "--dump-single-json", canonical_url(video_id)),
         timeout=METADATA_TIMEOUT_S,
     )
     if code != 0:
@@ -267,9 +359,9 @@ async def fetch_captions(video_id: str, lang: str, is_auto: bool) -> List[Dict[s
     flag = "--write-auto-subs" if is_auto else "--write-subs"
     with tempfile.TemporaryDirectory(prefix="yt-caps-") as tmp:
         code, _stdout, stderr = await _run(
-            [YT_DLP_BIN, "--skip-download", flag, "--sub-langs", lang,
-             "--sub-format", "json3", "--no-warnings", "--no-playlist",
-             "-o", "cap.%(ext)s", canonical_url(video_id)],
+            _yt_dlp("--skip-download", flag, "--sub-langs", lang,
+                    "--sub-format", "json3", "-o", "cap.%(ext)s",
+                    canonical_url(video_id)),
             timeout=CAPTION_TIMEOUT_S,
             cwd=tmp,
         )
@@ -293,8 +385,8 @@ async def fetch_audio(video_id: str, tmpdir: str) -> Tuple[bytes, str]:
     heap, and yt-dlp's own retry/resume logic still applies.
     """
     code, _stdout, stderr = await _run(
-        [YT_DLP_BIN, "-f", "bestaudio/best", "--extract-audio", "--audio-format", "m4a",
-         "--no-warnings", "--no-playlist", "-o", "audio.%(ext)s", canonical_url(video_id)],
+        _yt_dlp("-f", "bestaudio/best", "--extract-audio", "--audio-format", "m4a",
+                "-o", "audio.%(ext)s", canonical_url(video_id)),
         timeout=AUDIO_TIMEOUT_S,
         cwd=tmpdir,
     )

@@ -282,10 +282,23 @@ services:
       - YOUTUBE_MAX_CONCURRENT_JOBS=${YOUTUBE_MAX_CONCURRENT_JOBS:-1}
       - YOUTUBE_MAX_DURATION_SECONDS=${YOUTUBE_MAX_DURATION_SECONDS:-14400}
       - YOUTUBE_CAPTION_LANGS=${YOUTUBE_CAPTION_LANGS:-en,en-US,en-GB}
+      # YouTube blocks datacenter IPs outright — on EC2 even a plain watch-page
+      # GET is bot-gated, so no yt-dlp flag tuning helps. Set ONE of these or the
+      # YouTube endpoints fail on every video from a cloud host:
+      #   YOUTUBE_COOKIES_FILE — path INSIDE the container; put the cookies.txt at
+      #     the host path in YOUTUBE_COOKIES_HOST_FILE and it mounts read-only.
+      #     Use a throwaway Google account, never the notetaker one.
+      #   YOUTUBE_PROXY — residential/mobile egress, e.g. http://user:pass@host:port
+      - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
+      - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
       - CF_D1_YOUTUBE_TABLE=${CF_D1_YOUTUBE_TABLE:-youtube_transcripts}
       - CF_D1_YOUTUBE_SEGMENTS_TABLE=${CF_D1_YOUTUBE_SEGMENTS_TABLE:-youtube_transcript_segments}
     volumes:
       - ${LOCAL_STORAGE_VOLUME_SOURCE:-recordings-data}:/data/recordings
+      # YouTube cookies.txt, read-only. Defaults to mounting the compose file
+      # itself at an unused path — a harmless no-op that keeps the mount valid
+      # when no cookies are configured (compose has no conditional volumes).
+      - ${YOUTUBE_COOKIES_HOST_FILE:-./docker-compose.yml}:${YOUTUBE_COOKIES_FILE:-/tmp/.no-youtube-cookies}:ro
     init: true
     depends_on:
       - redis

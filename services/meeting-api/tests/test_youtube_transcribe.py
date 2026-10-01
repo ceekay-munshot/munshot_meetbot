@@ -230,3 +230,79 @@ class _FakeRow:
     video_id = "aircAruvnKk"
     user_id = 7
     status = "queued"
+
+
+# --- Datacenter-IP blocking --------------------------------------------------
+def test_bot_gate_error_is_rewritten_for_the_end_user():
+    """yt-dlp's bot-gate text is three lines of --cookies-from-browser advice and
+    GitHub wiki links aimed at someone on a laptop. Rendered verbatim in a
+    customer's transcript page it reads as "your video is broken" — it isn't, the
+    server just can't reach YouTube."""
+    stderr = (
+        b"ERROR: [youtube] 0y6wiBzPMSI: Sign in to confirm you're not a bot. "
+        b"Use --cookies-from-browser or --cookies for the authentication. "
+        b"See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp\n"
+    )
+    reason = yt._stderr_reason(stderr)
+    assert reason == yt.BOT_GATE_MESSAGE
+    assert "--cookies-from-browser" not in reason
+    assert "github.com" not in reason
+
+
+@pytest.mark.parametrize("raw,expected_substring", [
+    (b"ERROR: [youtube] x: Private video. Sign in if you've been granted access", "Private video"),
+    (b"ERROR: [youtube] x: Video unavailable", "Video unavailable"),
+    (b"ERROR: [youtube] x: Sign in to confirm your age", "confirm your age"),
+])
+def test_other_errors_are_still_passed_through_verbatim(raw, expected_substring):
+    """Only the bot gate is rewritten — a genuinely private/removed video must
+    still say so. Note the age-gate message also contains 'Sign in to confirm'
+    but not the bot-gate wording, so it must not be swallowed."""
+    assert expected_substring in yt._stderr_reason(raw)
+
+
+def test_every_yt_dlp_call_carries_cookies_and_proxy(monkeypatch):
+    """A cookies file applied to metadata but not captions/audio just moves the
+    failure one step later, so the argv builder is the single choke point."""
+    monkeypatch.setattr(yt, "YOUTUBE_COOKIES_FILE", "/secrets/yt.txt")
+    monkeypatch.setattr(yt, "YOUTUBE_PROXY", "http://user:pass@residential:8080")
+    monkeypatch.setattr(yt, "_check_cookies_file", lambda: None)
+
+    argv = yt._yt_dlp("--skip-download", "URL")
+    assert argv[:1] == [yt.YT_DLP_BIN]
+    assert "--cookies" in argv and argv[argv.index("--cookies") + 1] == "/secrets/yt.txt"
+    assert "--proxy" in argv and argv[argv.index("--proxy") + 1].endswith(":8080")
+    assert argv[-2:] == ["--skip-download", "URL"]
+
+
+def test_no_cookie_or_proxy_flags_when_unset(monkeypatch):
+    monkeypatch.setattr(yt, "YOUTUBE_COOKIES_FILE", "")
+    monkeypatch.setattr(yt, "YOUTUBE_PROXY", "")
+    argv = yt._yt_dlp("URL")
+    assert "--cookies" not in argv and "--proxy" not in argv
+
+
+def test_missing_cookies_file_names_the_mount(monkeypatch):
+    monkeypatch.setattr(yt, "YOUTUBE_COOKIES_FILE", "/secrets/nope.txt")
+    with pytest.raises(yt.YouTubeError, match="YOUTUBE_COOKIES_HOST_FILE"):
+        yt._check_cookies_file()
+
+
+def test_non_cookies_file_is_rejected(tmp_path, monkeypatch):
+    """The compose mount falls back to the compose file itself when no cookies
+    host path is set; handing yt-dlp YAML to parse as cookies fails obscurely."""
+    bogus = tmp_path / "docker-compose.yml"
+    bogus.write_text("services:\n  meeting-api:\n    image: x\n")
+    monkeypatch.setattr(yt, "YOUTUBE_COOKIES_FILE", str(bogus))
+    with pytest.raises(yt.YouTubeError, match="not a Netscape"):
+        yt._check_cookies_file()
+
+
+def test_valid_cookies_file_passes(tmp_path, monkeypatch):
+    good = tmp_path / "cookies.txt"
+    good.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t1799999999\tSID\tabc123\n"
+    )
+    monkeypatch.setattr(yt, "YOUTUBE_COOKIES_FILE", str(good))
+    yt._check_cookies_file()  # must not raise
